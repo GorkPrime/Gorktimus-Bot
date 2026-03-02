@@ -1,5 +1,5 @@
-import { Telegraf } from "telegraf";
-import axios from "axios";
+const { Telegraf } = require("telegraf");
+const axios = require("axios");
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
 if (!token) {
@@ -9,12 +9,11 @@ if (!token) {
 
 const bot = new Telegraf(token);
 
-// Helper: fetch DexScreener pairs by query (token address, pair address, or symbol)
+// Helper: fetch DexScreener pairs by query
 async function fetchDex(query) {
   const url = `https://api.dexscreener.com/latest/dex/search?q=${encodeURIComponent(query)}`;
   const { data } = await axios.get(url, { timeout: 15000 });
-  const pairs = Array.isArray(data?.pairs) ? data.pairs : [];
-  return pairs;
+  return Array.isArray(data?.pairs) ? data.pairs : [];
 }
 
 function formatUSD(n) {
@@ -25,7 +24,6 @@ function formatUSD(n) {
   return `$${num.toFixed(2)}`;
 }
 
-// Simple “defensible” scoring rules (MVP)
 function riskScore(pair) {
   let score = 100;
 
@@ -35,22 +33,14 @@ function riskScore(pair) {
   const ageMs = Date.now() - Number(pair?.pairCreatedAt ?? Date.now());
   const ageHours = ageMs / (1000 * 60 * 60);
 
-  // Liquidity
   if (liq < 20000) score -= 30;
   else if (liq < 50000) score -= 15;
 
-  // Volume
   if (vol24 < 10000) score -= 20;
-
-  // Spike risk
   if (change5m > 30) score -= 10;
-
-  // Super new token risk
   if (ageHours < 24) score -= 10;
 
-  // Clamp
-  if (score < 0) score = 0;
-  if (score > 100) score = 100;
+  score = Math.max(0, Math.min(100, score));
 
   let label = "✅ Low (relative)";
   if (score < 60) label = "🚨 High";
@@ -60,9 +50,7 @@ function riskScore(pair) {
 }
 
 bot.start((ctx) => {
-  ctx.reply(
-    "🤖 Prime Bot online.\n\nCommands:\n/scan <token>\n/score <token>\nExample: /score SOL"
-  );
+  ctx.reply("🤖 Prime Bot online.\n\nCommands:\n/scan <token>\n/score <token>\nExample: /score SOL");
 });
 
 bot.command("scan", async (ctx) => {
@@ -73,7 +61,7 @@ bot.command("scan", async (ctx) => {
     const pairs = await fetchDex(q);
     if (!pairs.length) return ctx.reply("No results found on DexScreener.");
 
-    const p = pairs[0]; // MVP: take top match
+    const p = pairs[0];
     const msg =
       `🔎 Scan Result\n` +
       `Pair: ${p.baseToken?.symbol ?? "?"}/${p.quoteToken?.symbol ?? "?"}\n` +
@@ -107,7 +95,7 @@ bot.command("score", async (ctx) => {
       `Score: ${r.score}/100 (${r.label})\n` +
       `Liquidity: ${formatUSD(p.liquidity?.usd)} | Vol 24h: ${formatUSD(p.volume?.h24)}\n` +
       `Age: ${r.ageHours.toFixed(1)} hours\n` +
-      `Note: This is a risk indicator — not financial advice.\n` +
+      `Note: Risk indicator only — not financial advice.\n` +
       `Link: ${p.url ?? "N/A"}`;
 
     return ctx.reply(msg);
@@ -117,10 +105,8 @@ bot.command("score", async (ctx) => {
   }
 });
 
-// Start bot (long polling — easiest)
 bot.launch();
 console.log("Prime Bot running...");
 
-// Graceful stop
 process.once("SIGINT", () => bot.stop("SIGINT"));
 process.once("SIGTERM", () => bot.stop("SIGTERM"));
