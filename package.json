@@ -10,7 +10,7 @@
     "node": ">=18"
   },
   "dependencies": {
-** Node cr    "axios": "^1.6.8",
+  Node cr    "axios": "^1.6.8",
     "telegraf": "^4.16.3"
   }
 }
