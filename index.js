@@ -216,7 +216,7 @@ async function alertLoop() {
       const alerts = [];
 
       // Big 5m move
-      if (Math.abs(change5m) >= 15) {
+      if (Math.abs(change5m) >= 3) {
         alerts.push(`⚡ 5m move: ${change5m}%`);
       }
 
