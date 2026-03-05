@@ -1,11 +1,18 @@
+{
   "name": "gorktimus-prime-bot",
   "version": "1.0.0",
-  "description": "Gorktimus Prime Telegram Intelligence Terminal",
+  "description": "Gorktimus Prime Telegram bot",
   "main": "index.js",
+  "type": "commonjs",
   "scripts": {
     "start": "node index.js"
   },
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
+    "axios": "^1.6.8",
     "node-telegram-bot-api": "^0.63.0",
     "sqlite3": "^5.1.6"
   }
+}
