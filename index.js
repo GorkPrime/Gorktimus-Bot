@@ -257,6 +257,12 @@ async function handleWatchQuery(chatId, input) {
 // ===================== START =====================
 bot.onText(/\/start/, async (msg) => {
   const chatId = msg.chat.id;
+
+  await bot.sendPhoto(chatId, INTRO_IMG, {
+    caption: "🧠 Gorktimus Prime Terminal"
+  });
+
+});
   ensureUser(chatId);
   await sendTerminal(chatId, "🛡️ GORKTIMUS PRIME TERMINAL\nSelect an option below.", mainMenu());
 });
