@@ -654,6 +654,174 @@ async function fetchTokenProfileImage(chainId, tokenAddress, fallbackPair = null
   }
 }
 
+// ================= GORKTIMUS RISK VERDICT =================
+function getLiquidityHealth(liquidityUsd) {
+  const liq = num(liquidityUsd);
+  if (liq >= 100000) {
+    return { label: "Strong", emoji: "✅", score: 22 };
+  }
+  if (liq >= 40000) {
+    return { label: "Healthy", emoji: "✅", score: 18 };
+  }
+  if (liq >= 15000) {
+    return { label: "Moderate", emoji: "⚠️", score: 10 };
+  }
+  if (liq > 0) {
+    return { label: "Weak", emoji: "⚠️", score: 4 };
+  }
+  return { label: "Unknown", emoji: "⚠️", score: 0 };
+}
+
+function getAgeRisk(ageMin) {
+  if (!ageMin) {
+    return { label: "Unknown", score: 0 };
+  }
+  if (ageMin < 5) {
+    return { label: "Extremely Fresh", score: 2 };
+  }
+  if (ageMin < 30) {
+    return { label: "Very Early", score: 5 };
+  }
+  if (ageMin < 180) {
+    return { label: "Early", score: 10 };
+  }
+  if (ageMin < 1440) {
+    return { label: "Developing", score: 14 };
+  }
+  return { label: "Established", score: 18 };
+}
+
+function getFlowHealth(pair) {
+  const buys = num(pair.buysM5);
+  const sells = num(pair.sellsM5);
+  const total = buys + sells;
+
+  if (total === 0) {
+    return { label: "Limited Recent Flow", score: 4 };
+  }
+
+  const ratio = buys / Math.max(sells, 1);
+
+  if (ratio >= 2.5 && buys >= 10) {
+    return { label: "Strong Buy Pressure", score: 18 };
+  }
+  if (ratio >= 1.3) {
+    return { label: "Positive Flow", score: 12 };
+  }
+  if (ratio >= 0.85) {
+    return { label: "Mixed Flow", score: 7 };
+  }
+  return { label: "Sell Pressure", score: 2 };
+}
+
+function getVolumeHealth(volumeH24) {
+  const vol = num(volumeH24);
+  if (vol >= 500000) return { label: "Strong", score: 18 };
+  if (vol >= 100000) return { label: "Healthy", score: 14 };
+  if (vol >= 25000) return { label: "Moderate", score: 8 };
+  if (vol > 0) return { label: "Light", score: 4 };
+  return { label: "Unknown", score: 0 };
+}
+
+function buildRecommendation(score, ageMin, pair) {
+  const liq = num(pair.liquidityUsd);
+  const buys = num(pair.buysM5);
+  const sells = num(pair.sellsM5);
+
+  if (liq < 10000) {
+    return "High risk. Liquidity is thin, so even small exits can hit price hard.";
+  }
+  if (ageMin > 0 && ageMin < 10) {
+    return "Ultra-early token. Watch closely before sizing in because conditions can change fast.";
+  }
+  if (sells > buys * 1.2) {
+    return "Caution. Recent order flow leans bearish, so momentum is not yet convincing.";
+  }
+  if (score >= 75) {
+    return "Stronger setup than most. Still use discipline, but current market structure looks healthier.";
+  }
+  if (score >= 55) {
+    return "Proceed with caution. Some structure is there, but this still needs confirmation.";
+  }
+  return "Speculative setup. Treat this as a high-risk play until more data matures.";
+}
+
+async function buildRiskVerdict(pair) {
+  const ageMin = ageMinutesFromMs(pair.pairCreatedAt);
+  const liquidity = getLiquidityHealth(pair.liquidityUsd);
+  const age = getAgeRisk(ageMin);
+  const flow = getFlowHealth(pair);
+  const volume = getVolumeHealth(pair.volumeH24);
+
+  const orders = await fetchTokenOrders(pair.chainId, pair.baseAddress);
+  const approvedCount = orders.filter((x) => x?.status === "approved").length;
+
+  let transparencyLabel = "Unknown";
+  let transparencyEmoji = "⚠️";
+  let transparencyScore = 4;
+
+  if (approvedCount >= 2) {
+    transparencyLabel = "Better Signal";
+    transparencyEmoji = "✅";
+    transparencyScore = 14;
+  } else if (approvedCount >= 1) {
+    transparencyLabel = "Some Signal";
+    transparencyEmoji = "⚠️";
+    transparencyScore = 10;
+  }
+
+  let honeypotLabel = "Unknown";
+  let honeypotEmoji = "⚠️";
+  let honeypotScore = 6;
+
+  const chain = String(pair.chainId || "").toLowerCase();
+  if (chain === "solana") {
+    honeypotLabel = "Not Fully Testable";
+    honeypotEmoji = "⚠️";
+    honeypotScore = 8;
+  } else if (chain === "base" || chain === "ethereum") {
+    honeypotLabel = "Unverified";
+    honeypotEmoji = "⚠️";
+    honeypotScore = 6;
+  }
+
+  let holderLabel = "Unknown";
+  let holderEmoji = "⚠️";
+  let holderScore = 6;
+
+  if (num(pair.liquidityUsd) >= 100000 && num(pair.volumeH24) >= 250000 && ageMin >= 180) {
+    holderLabel = "Likely More Distributed";
+    holderEmoji = "✅";
+    holderScore = 12;
+  } else if (num(pair.liquidityUsd) >= 25000 && ageMin >= 30) {
+    holderLabel = "Moderate Visibility";
+    holderEmoji = "⚠️";
+    holderScore = 8;
+  }
+
+  let rawScore =
+    liquidity.score +
+    age.score +
+    flow.score +
+    volume.score +
+    transparencyScore +
+    honeypotScore +
+    holderScore;
+
+  rawScore = Math.max(0, Math.min(100, Math.round(rawScore)));
+
+  const recommendation = buildRecommendation(rawScore, ageMin, pair);
+
+  return {
+    honeypot: `${honeypotEmoji} ${honeypotLabel}`,
+    transparency: `${transparencyEmoji} ${transparencyLabel}`,
+    holders: `${holderEmoji} ${holderLabel}`,
+    liquidity: `${liquidity.emoji} ${liquidity.label}`,
+    score: rawScore,
+    recommendation
+  };
+}
+
 // ================= CARD BUILDERS =================
 function buildSourceLines(pair) {
   const dex = makeDexUrl(pair.chainId, pair.pairAddress, pair.url);
@@ -674,8 +842,9 @@ function clickableAddressLine(pair) {
   return `📍 Address: <a href="${dex}">${addrText}</a>`;
 }
 
-function buildScanCard(pair, title = "🔎 Token Scan") {
+async function buildScanCard(pair, title = "🔎 Token Scan") {
   const ageLabel = ageFromMs(pair.pairCreatedAt);
+  const verdict = await buildRiskVerdict(pair);
 
   const lines = [
     `🧠 <b>Gorktimus Intelligence Terminal</b>`,
@@ -688,6 +857,17 @@ function buildScanCard(pair, title = "🔎 Token Scan") {
     `⛓️ <b>Chain:</b> ${escapeHtml(humanChain(pair.chainId))}`,
     `⏱️ <b>Age:</b> ${escapeHtml(ageLabel)}`,
     ``,
+    `🧠 <b>Gorktimus Risk Verdict</b>`,
+    `⚠️ <b>Honeypot Check:</b> ${escapeHtml(verdict.honeypot)}`,
+    `🔍 <b>Contract Transparency:</b> ${escapeHtml(verdict.transparency)}`,
+    `👥 <b>Holder Concentration:</b> ${escapeHtml(verdict.holders)}`,
+    `💧 <b>Liquidity Health:</b> ${escapeHtml(verdict.liquidity)}`,
+    ``,
+    `📊 <b>Safety Score:</b> ${escapeHtml(String(verdict.score))} / 100`,
+    ``,
+    `📢 <b>Recommendation:</b> ${escapeHtml(verdict.recommendation)}`,
+    ``,
+    `📈 <b>Market Data</b>`,
     `💲 <b>Price:</b> ${escapeHtml(shortUsd(pair.priceUsd))}`,
     `💧 <b>Liquidity:</b> ${escapeHtml(shortUsd(pair.liquidityUsd))}`,
     `📊 <b>Market Cap:</b> ${escapeHtml(shortUsd(pair.marketCap || pair.fdv))}`,
@@ -698,6 +878,8 @@ function buildScanCard(pair, title = "🔎 Token Scan") {
     `🔄 <b>Transactions:</b> ${escapeHtml(String(pair.txnsM5))}`,
     ``,
     clickableAddressLine(pair),
+    ``,
+    `🔗 <b>Data Sources</b>`,
     ...buildSourceLines(pair)
   ];
 
@@ -721,8 +903,9 @@ function buildLaunchVerdict(pair) {
   return "🧠 Verdict: This token has been trading long enough to show a more stable market profile than most fresh launches.";
 }
 
-function buildLaunchCard(pair, rank = 0) {
+async function buildLaunchCard(pair, rank = 0) {
   const title = rank > 0 ? `📡 Launch Radar #${rank}` : "📡 Launch Radar";
+  const verdict = await buildRiskVerdict(pair);
 
   const lines = [
     `🧠 <b>Gorktimus Intelligence Terminal</b>`,
@@ -735,6 +918,17 @@ function buildLaunchCard(pair, rank = 0) {
     `⛓️ <b>Chain:</b> ${escapeHtml(humanChain(pair.chainId))}`,
     `⏱️ <b>Age:</b> ${escapeHtml(ageFromMs(pair.pairCreatedAt))}`,
     ``,
+    `🧠 <b>Gorktimus Risk Verdict</b>`,
+    `⚠️ <b>Honeypot Check:</b> ${escapeHtml(verdict.honeypot)}`,
+    `🔍 <b>Contract Transparency:</b> ${escapeHtml(verdict.transparency)}`,
+    `👥 <b>Holder Concentration:</b> ${escapeHtml(verdict.holders)}`,
+    `💧 <b>Liquidity Health:</b> ${escapeHtml(verdict.liquidity)}`,
+    ``,
+    `📊 <b>Safety Score:</b> ${escapeHtml(String(verdict.score))} / 100`,
+    ``,
+    `📢 <b>Recommendation:</b> ${escapeHtml(verdict.recommendation)}`,
+    ``,
+    `📈 <b>Market Data</b>`,
     `💲 <b>Price:</b> ${escapeHtml(shortUsd(pair.priceUsd))}`,
     `💧 <b>Liquidity:</b> ${escapeHtml(shortUsd(pair.liquidityUsd))}`,
     `📊 <b>Market Cap:</b> ${escapeHtml(shortUsd(pair.marketCap || pair.fdv))}`,
@@ -747,6 +941,8 @@ function buildLaunchCard(pair, rank = 0) {
     buildLaunchVerdict(pair),
     ``,
     clickableAddressLine(pair),
+    ``,
+    `🔗 <b>Data Sources</b>`,
     ...buildSourceLines(pair)
   ];
 
@@ -812,7 +1008,7 @@ async function runTokenScan(chatId, query) {
   }
 
   const imageUrl = await fetchTokenProfileImage(pair.chainId, pair.baseAddress, pair);
-  await sendCard(chatId, buildScanCard(pair, "🔎 Token Scan"), buildScanButtons(), imageUrl);
+  await sendCard(chatId, await buildScanCard(pair, "🔎 Token Scan"), buildScanButtons(), imageUrl);
 }
 
 async function showTrending(chatId) {
@@ -925,7 +1121,7 @@ async function showLaunchRadar(chatId) {
 
     await sendCard(
       chatId,
-      buildLaunchCard(pair, i + 1),
+      await buildLaunchCard(pair, i + 1),
       i === launches.length - 1 ? buildRefreshMainButtons("launch_radar") : {},
       imageUrl
     );
@@ -1012,7 +1208,7 @@ async function showPrimePicks(chatId) {
 
     await sendCard(
       chatId,
-      buildScanCard(pair, `⭐ Prime Picks #${i + 1}`),
+      await buildScanCard(pair, `⭐ Prime Picks #${i + 1}`),
       i === picks.length - 1 ? buildRefreshMainButtons("prime_picks") : {},
       imageUrl
     );
