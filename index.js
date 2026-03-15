@@ -10,9 +10,11 @@ const HELIUS_API_KEY = process.env.HELIUS_API_KEY || "";
 const ETHERSCAN_API_KEY = process.env.ETHERSCAN_API_KEY || "";
 const COMMUNITY_X_URL = process.env.COMMUNITY_X_URL || "https://x.com/gorktimusprime";
 const COMMUNITY_TELEGRAM_URL =
-  process.env.COMMUNITY_TELEGRAM_URL || "https://t.me/GorktimusPrime";
+  process.env.COMMUNITY_TELEGRAM_URL || "https://t.me/https://t.me/+A4h3DK3p2tNhNjlh
+";
 const REQUIRED_CHANNEL_USERNAME =
-  process.env.REQUIRED_CHANNEL_USERNAME || "@GorktimusPrime";
+  process.env.REQUIRED_CHANNEL_USERNAME || "@https://t.me/+A4h3DK3p2tNhNjlh
+";
 
 if (!BOT_TOKEN) {
   console.error("❌ TELEGRAM_BOT_TOKEN not set");
