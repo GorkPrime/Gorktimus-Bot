@@ -11,7 +11,7 @@ const ETHERSCAN_API_KEY = process.env.ETHERSCAN_API_KEY || "";
 const COMMUNITY_X_URL =
   process.env.COMMUNITY_X_URL || "https://x.com/gorktimusprime";
 const COMMUNITY_TELEGRAM_URL =
-  process.env.COMMUNITY_TELEGRAM_URL || "https://t.me/+A4h3DK3p2tNhNjlh";
+  process.env.COMMUNITY_TELEGRAM_URL || "https://t.me/gorktimusprimezone";
 
 // IMPORTANT:
 // This must be the Telegram channel/group username like @gorktimusprimezone
@@ -57,6 +57,7 @@ let bot = null;
 let walletScanInterval = null;
 let walletScanRunning = false;
 let shuttingDown = false;
+let BOT_USERNAME = "";
 
 // ================= DB HELPERS =================
 function run(sql, params = []) {
@@ -285,6 +286,20 @@ function makeGeckoUrl(chainId, pairAddress) {
   return "";
 }
 
+function getMsgChat(msgOrQuery) {
+  return msgOrQuery?.message?.chat || msgOrQuery?.chat || null;
+}
+
+function isPrivateChat(msgOrQuery) {
+  const chat = getMsgChat(msgOrQuery);
+  return chat?.type === "private";
+}
+
+function buildBotDeepLink() {
+  if (!BOT_USERNAME) return "";
+  return `https://t.me/${BOT_USERNAME}`;
+}
+
 // ================= USER / SUBSCRIPTION =================
 async function upsertUserFromMessage(msg, isSubscribed = 0) {
   const ts = nowTs();
@@ -388,22 +403,30 @@ async function ensureSubscribedOrBlock(msgOrQuery) {
 
 // ================= MENUS =================
 function buildMainMenu() {
+  const growthRow = BOT_USERNAME
+    ? [{ text: "🚀 Invite Friends", callback_data: "invite_friends" }]
+    : [];
+
+  const keyboard = [
+    [
+      { text: "🔎 Scan Token", callback_data: "scan_token" },
+      { text: "📈 Trending", callback_data: "trending" }
+    ],
+    [
+      { text: "📡 Launch Radar", callback_data: "launch_radar" },
+      { text: "⭐ Prime Picks", callback_data: "prime_picks" }
+    ],
+    [
+      { text: "🐋 Whale Tracker", callback_data: "whale_menu" },
+      { text: "❓ Help", callback_data: "help_menu" }
+    ]
+  ];
+
+  if (growthRow.length) keyboard.push(growthRow);
+
   return {
     reply_markup: {
-      inline_keyboard: [
-        [
-          { text: "🔎 Scan Token", callback_data: "scan_token" },
-          { text: "📈 Trending", callback_data: "trending" }
-        ],
-        [
-          { text: "📡 Launch Radar", callback_data: "launch_radar" },
-          { text: "⭐ Prime Picks", callback_data: "prime_picks" }
-        ],
-        [
-          { text: "🐋 Whale Tracker", callback_data: "whale_menu" },
-          { text: "❓ Help", callback_data: "help_menu" }
-        ]
-      ]
+      inline_keyboard: keyboard
     }
   };
 }
@@ -1479,6 +1502,22 @@ async function showWhaleMenu(chatId) {
   );
 }
 
+async function showInviteFriends(chatId) {
+  const botLink = buildBotDeepLink();
+
+  const text = [
+    `🧠 <b>Gorktimus Intelligence Terminal</b>`,
+    ``,
+    `🚀 <b>Invite Friends</b>`,
+    ``,
+    botLink
+      ? `Share this bot link:\n${escapeHtml(botLink)}`
+      : `Bot username not detected yet.`
+  ].join("\n");
+
+  await sendText(chatId, text, buildMainMenuOnlyButton());
+}
+
 async function promptScanToken(chatId) {
   pendingAction.set(chatId, { type: "SCAN_TOKEN" });
   await sendText(
@@ -1506,32 +1545,63 @@ async function runTokenScan(chatId, query) {
 }
 
 function pTrendScore(pair) {
-  return (
-    pair.volumeH24 * 2 +
-    pair.liquidityUsd * 1.5 +
-    pair.buysM5 * 450 -
-    pair.sellsM5 * 100 -
-    ageMinutesFromMs(pair.pairCreatedAt) * 10
-  );
+  const ageMin = ageMinutesFromMs(pair.pairCreatedAt);
+  const buyPressure = pair.buysM5 * 600;
+  const sellPenalty = pair.sellsM5 * 120;
+  const liq = pair.liquidityUsd * 1.8;
+  const vol = pair.volumeH24 * 2.3;
+  const freshnessBonus = Math.max(0, 300000 - ageMin * 350);
+
+  return liq + vol + buyPressure + freshnessBonus - sellPenalty;
+}
+
+async function buildTrendingCandidates(limit = 10) {
+  const profiles = await fetchLatestProfiles();
+  const boosts = await fetchLatestBoosts();
+  const merged = new Map();
+
+  for (const item of profiles) {
+    if (!item?.chainId || !item?.tokenAddress) continue;
+    if (!supportsChain(item.chainId)) continue;
+
+    merged.set(`${item.chainId}:${item.tokenAddress}`, {
+      chainId: String(item.chainId),
+      tokenAddress: String(item.tokenAddress)
+    });
+  }
+
+  for (const item of boosts) {
+    if (!item?.chainId || !item?.tokenAddress) continue;
+    if (!supportsChain(item.chainId)) continue;
+
+    merged.set(`${item.chainId}:${item.tokenAddress}`, {
+      chainId: String(item.chainId),
+      tokenAddress: String(item.tokenAddress)
+    });
+  }
+
+  const candidates = [];
+  for (const item of [...merged.values()].slice(0, 40)) {
+    const pair = await resolveTokenToBestPair(item.chainId, item.tokenAddress);
+    if (!pair) continue;
+    if (pair.liquidityUsd < 10000) continue;
+    if (pair.volumeH24 < 10000) continue;
+    if (pair.buysM5 + pair.sellsM5 < 3) continue;
+
+    pair._trendScore = pTrendScore(pair);
+    candidates.push(pair);
+  }
+
+  return candidates.sort((a, b) => b._trendScore - a._trendScore).slice(0, limit);
 }
 
 async function showTrending(chatId) {
-  let rawPairs = [];
+  let pairs = [];
   try {
-    rawPairs = await searchDexPairs("sol");
+    pairs = await buildTrendingCandidates(10);
   } catch (err) {
     console.log("showTrending fetch error:", err.message);
   }
-
-  const pairs = rawPairs
-    .filter((p) => supportsChain(p.chainId))
-    .filter((p) => p.liquidityUsd > 10000 && p.volumeH24 > 10000)
-    .sort((a, b) => {
-      const scoreA = pTrendScore(a);
-      const scoreB = pTrendScore(b);
-      return scoreB - scoreA;
-    })
-    .slice(0, 10);
 
   if (!pairs.length) {
     await sendText(
@@ -1757,8 +1827,9 @@ async function showSystemStatus(chatId) {
     `🐋 Whale Wallets: ${whaleCount?.c || 0}`,
     `👤 Dev Wallets: ${devCount?.c || 0}`,
     `🔔 Alerted Wallets: ${alertEnabledCount?.c || 0}`,
-    `⏱️ Wallet Monitor: ${hasHelius() ? `${WALLET_SCAN_INTERVAL_MS / 1000}s` : "Unavailable"}`
-  ];
+    `⏱️ Wallet Monitor: ${hasHelius() ? `${WALLET_SCAN_INTERVAL_MS / 1000}s` : "Unavailable"}`,
+    BOT_USERNAME ? `🤖 Bot Username: @${BOT_USERNAME}` : ""
+  ].filter(Boolean);
 
   await sendText(chatId, lines.join("\n"), buildMainMenuOnlyButton());
 }
@@ -1773,7 +1844,7 @@ async function showHowToUse(chatId) {
     `Analyze a token by ticker, token address, or pair search.`,
     ``,
     `📈 <b>Trending</b>`,
-    `View 10 active tokens with live market data and DexScreener links.`,
+    `View stronger live candidates built from recent profiles, boosts, liquidity, volume, and flow.`,
     ``,
     `📡 <b>Launch Radar</b>`,
     `Review newer launches with a short market verdict.`,
@@ -2334,6 +2405,8 @@ async function handlePendingAction(chatId, text) {
 async function registerHandlers() {
   bot.onText(/\/start/, async (msg) => {
     try {
+      if (!isPrivateChat(msg)) return;
+
       await upsertUserFromMessage(msg, 0);
 
       const ok = await ensureSubscribedOrBlock(msg);
@@ -2347,6 +2420,8 @@ async function registerHandlers() {
 
   bot.onText(/\/menu/, async (msg) => {
     try {
+      if (!isPrivateChat(msg)) return;
+
       await upsertUserFromMessage(msg, 0);
 
       const ok = await ensureSubscribedOrBlock(msg);
@@ -2360,6 +2435,8 @@ async function registerHandlers() {
 
   bot.onText(/\/scan(?:\s+(.+))?/, async (msg, match) => {
     try {
+      if (!isPrivateChat(msg)) return;
+
       await upsertUserFromMessage(msg, 0);
 
       const ok = await ensureSubscribedOrBlock(msg);
@@ -2385,6 +2462,7 @@ async function registerHandlers() {
       await answerCallbackSafe(query.id);
 
       if (!chatId) return;
+      if (!isPrivateChat(query)) return;
 
       if (data === "check_subscription") {
         const ok = await ensureSubscribedOrBlock(query);
@@ -2422,6 +2500,8 @@ async function registerHandlers() {
         await showDataSources(chatId);
       } else if (data === "help_community") {
         await showCommunity(chatId);
+      } else if (data === "invite_friends") {
+        await showInviteFriends(chatId);
       } else if (data === "add_whale") {
         pendingAction.set(chatId, { type: "ADD_WHALE_WALLET" });
         await sendText(
@@ -2486,6 +2566,8 @@ async function registerHandlers() {
 
   bot.on("message", async (msg) => {
     try {
+      if (!isPrivateChat(msg)) return;
+
       const chatId = msg.chat.id;
       const text = msg.text;
 
@@ -2570,6 +2652,13 @@ process.once("SIGINT", () => shutdown("SIGINT"));
     console.log("deleteWebHook warning:", err.message);
   }
 
+  try {
+    const me = await bot.getMe();
+    BOT_USERNAME = me?.username || "";
+  } catch (err) {
+    console.log("getMe warning:", err.message);
+  }
+
   await registerHandlers();
   await bot.startPolling();
 
@@ -2578,6 +2667,7 @@ process.once("SIGINT", () => shutdown("SIGINT"));
   console.log("🔑 Helius enabled:", hasHelius());
   console.log("🔑 Etherscan enabled:", hasEtherscanKey());
   console.log("📢 Required channel:", REQUIRED_CHANNEL);
+  console.log("🤖 Bot username:", BOT_USERNAME || "unknown");
 
   if (hasHelius()) {
     walletScanInterval = setInterval(() => {
