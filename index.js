@@ -1479,10 +1479,9 @@ function buildTrendingLine(pair, idx) {
 
 // ================= MARKET SCREENS =================
 async function showMainMenu(chatId) {
-  await sendMenu(
-    chatId,
-    `🧠 <b>Gorktimus Intelligence Terminal</b>\n\nLive intelligence. On-demand execution.\nNo clutter. No spam.\n\nSelect an operation below.`,
-    buildMainMenu()
+  await const pulse = await getNetworkPulse();
+
+`🧠 <b>Gorktimus Intelligence Terminal</b>\n\n${pulse}\n\nLive intelligence...`
   );
 }
 
@@ -2572,6 +2571,7 @@ async function registerHandlers() {
       const text = msg.text;
 
       await upsertUserFromMessage(msg, 0);
+      await trackUserActivity(msg.from.id);
 
       if (!text) return;
       if (text.startsWith("/start") || text.startsWith("/menu") || text.startsWith("/scan")) return;
@@ -2583,6 +2583,7 @@ async function registerHandlers() {
       if (handled) return;
 
       if (isAddressLike(text.trim())) {
+        await trackScan(chatId);
         await runTokenScan(chatId, text.trim());
       }
     } catch (err) {
