@@ -41,6 +41,9 @@ const WALLET_SCAN_INTERVAL_MS = 20000;
 const DEX_TIMEOUT_MS = 15000;
 const HELIUS_TIMEOUT_MS = 20000;
 const TELEGRAM_SEND_RETRY_MS = 900;
+const WATCHLIST_SCAN_INTERVAL_MS = 180000;
+const WATCHLIST_ALERT_COOLDOWN_SEC = 1800;
+const MAX_WATCHLIST_ITEMS = 30;
 
 const ETHERSCAN_V2_URL = "https://api.etherscan.io/v2/api";
 const HONEYPOT_API_BASE = "https://api.honeypot.is";
@@ -55,11 +58,14 @@ const db = new sqlite3.Database(DB_PATH);
 const pendingAction = new Map();
 let bot = null;
 let walletScanInterval = null;
+let watchlistScanInterval = null;
 let walletScanRunning = false;
 let shuttingDown = false;
 let BOT_USERNAME = "";
 let heliusCooldownUntil = 0;
 const HELIUS_COOLDOWN_MS = 60000;
+const HELIUS_CACHE_TTL_MS = 180000;
+const heliusLargestAccountsCache = new Map();
 
 // ================= DB HELPERS =================
 function run(sql, params = []) {
@@ -139,6 +145,72 @@ await run(`
       updated_at INTEGER NOT NULL
     )
   `);
+
+  await run(`
+    CREATE TABLE IF NOT EXISTS user_settings (
+      user_id TEXT PRIMARY KEY,
+      mode TEXT DEFAULT 'balanced',
+      alerts_enabled INTEGER DEFAULT 1,
+      launch_alerts INTEGER DEFAULT 1,
+      smart_alerts INTEGER DEFAULT 1,
+      risk_alerts INTEGER DEFAULT 1,
+      whale_alerts INTEGER DEFAULT 1,
+      explanation_level TEXT DEFAULT 'deep',
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    )
+  `);
+
+  await run(`
+    CREATE TABLE IF NOT EXISTS watchlist (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      chat_id TEXT NOT NULL,
+      chain_id TEXT NOT NULL,
+      token_address TEXT NOT NULL,
+      symbol TEXT,
+      pair_address TEXT,
+      active INTEGER DEFAULT 1,
+      alerts_enabled INTEGER DEFAULT 1,
+      added_price REAL DEFAULT 0,
+      last_price REAL DEFAULT 0,
+      last_liquidity REAL DEFAULT 0,
+      last_volume REAL DEFAULT 0,
+      last_score INTEGER DEFAULT 0,
+      last_alert_ts INTEGER DEFAULT 0,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      UNIQUE(chat_id, chain_id, token_address)
+    )
+  `);
+
+  await run(`
+    CREATE TABLE IF NOT EXISTS pair_memory (
+      memory_key TEXT PRIMARY KEY,
+      learned_bias REAL DEFAULT 0,
+      positive_events INTEGER DEFAULT 0,
+      negative_events INTEGER DEFAULT 0,
+      last_outcome TEXT,
+      last_price REAL DEFAULT 0,
+      last_liquidity REAL DEFAULT 0,
+      last_volume REAL DEFAULT 0,
+      last_seen_at INTEGER DEFAULT 0,
+      updated_at INTEGER NOT NULL
+    )
+  `);
+
+  await run(`
+    CREATE TABLE IF NOT EXISTS scan_feedback (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id TEXT,
+      chain_id TEXT,
+      token_address TEXT,
+      pair_address TEXT,
+      symbol TEXT,
+      feedback TEXT,
+      score_snapshot INTEGER,
+      created_at INTEGER NOT NULL
+    )
+  `);
 }
 
 // ================= HELPERS =================
@@ -160,6 +232,49 @@ function escapeHtml(value) {
 function num(value, fallback = 0) {
   const n = Number(value);
   return Number.isFinite(n) ? n : fallback;
+}
+
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, num(value)));
+}
+
+async function retryOperation(label, fn, options = {}) {
+  const {
+    attempts = 5,
+    baseDelay = 700,
+    maxDelay = 9000,
+    backoff = 1.8,
+    jitter = 200,
+    shouldRetry = () => true,
+    onRetry = null
+  } = options;
+
+  let lastErr = null;
+
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      return await fn(attempt);
+    } catch (err) {
+      lastErr = err;
+      const retryable = shouldRetry(err, attempt);
+      if (!retryable || attempt === attempts) break;
+
+      const delay = Math.min(
+        maxDelay,
+        Math.floor(baseDelay * Math.pow(backoff, attempt - 1))
+      ) + Math.floor(Math.random() * jitter);
+
+      if (typeof onRetry === "function") {
+        try {
+          onRetry(err, attempt, delay);
+        } catch (_) {}
+      }
+
+      await sleep(delay);
+    }
+  }
+
+  throw lastErr || new Error(`${label} failed`);
 }
 
 function shortUsd(n) {
@@ -228,6 +343,98 @@ function humanChain(chainId) {
 
 function buildGeneratedStamp() {
   return "Generated: just now";
+}
+
+function compactChainId(chainId) {
+  const c = String(chainId || "").toLowerCase();
+  if (c === "solana") return "s";
+  if (c === "base") return "b";
+  if (c === "ethereum") return "e";
+  return c.slice(0, 1) || "x";
+}
+
+function expandCompactChainId(value) {
+  const c = String(value || "").toLowerCase();
+  if (c === "s") return "solana";
+  if (c === "b") return "base";
+  if (c === "e") return "ethereum";
+  return c;
+}
+
+function safeSymbolText(symbol, fallback = "Token") {
+  const s = String(symbol || "").trim();
+  return s ? s : fallback;
+}
+
+function tradingConceptReply(lower) {
+  if (/(entry|enter|buy in|good entry|bad entry|chasing)/i.test(lower)) {
+    return [
+      `🧠 <b>Trading Read</b>`,
+      ``,
+      `A cleaner entry usually has three things working together:`,
+      `• liquidity that can absorb exits`,
+      `• flow that is not obviously manufactured`,
+      `• a setup you are not blindly chasing after a vertical move`,
+      ``,
+      `If price already exploded while liquidity is still thin, that is usually a worse entry than a calmer structure with real support underneath it.`
+    ].join("\n");
+  }
+  if (/(liquidity|market cap|mcap|fdv)/i.test(lower)) {
+    return [
+      `🧠 <b>Liquidity vs Market Cap</b>`,
+      ``,
+      `Market cap tells you how large the token is priced.`,
+      `Liquidity tells you how much real depth exists to enter or exit.`,
+      ``,
+      `A token can show a big market cap and still be dangerous if liquidity is thin.`,
+      `That is why Gorktimus treats liquidity as one of the most important defensive inputs.`
+    ].join("\n");
+  }
+  if (/(volume|transactions|tx|buys|sells|flow|spam)/i.test(lower)) {
+    return [
+      `🧠 <b>Volume / Transactions Read</b>`,
+      ``,
+      `High volume and high transactions are not automatically bullish.`,
+      `The move matters more when activity is supported by decent liquidity and the recent flow does not look spammy or one-sided in a suspicious way.`,
+      ``,
+      `That is why the terminal looks at transaction behavior instead of treating raw activity as truth.`
+    ].join("\n");
+  }
+  if (/(scalp|swing|hold|timeframe|time frame)/i.test(lower)) {
+    return [
+      `🧠 <b>Timeframe Read</b>`,
+      ``,
+      `Scalp logic cares more about current flow, spread, and immediate liquidity response.`,
+      `Swing logic cares more about structure, holder concentration, and whether the move looks sustainable after the first burst.`,
+      ``,
+      `The same token can be tradable for a scalp and still be weak for a longer hold.`
+    ].join("\n");
+  }
+  if (/(stop loss|risk reward|rr|position size|sizing|slippage)/i.test(lower)) {
+    return [
+      `🧠 <b>Risk Management</b>`,
+      ``,
+      `The cleaner the structure, the more room you have to think in terms of setups.`,
+      `The weaker the liquidity and holder structure, the smaller the position should usually be.`,
+      ``,
+      `Early tokens are not where blind size belongs. They are where disciplined size matters most.`
+    ].join("\n");
+  }
+  if (/(rug|trap|honeypot|tax)/i.test(lower)) {
+    return [
+      `🧠 <b>Trap / Rug Read</b>`,
+      ``,
+      `A dangerous token often shows a stack of weak signals together:`,
+      `• thin liquidity`,
+      `• concentration risk`,
+      `• poor transparency`,
+      `• ugly taxes or direct honeypot behavior`,
+      `• spammy or manufactured flow`,
+      ``,
+      `Gorktimus is designed to weigh the stack, not just one signal in isolation.`
+    ].join("\n");
+  }
+  return "";
 }
 
 function ageMinutesFromMs(createdAtMs) {
@@ -368,6 +575,237 @@ async function getChannelSubscriberCount() {
   }
 }
 
+function safeMode(mode) {
+  const m = String(mode || '').toLowerCase();
+  if (["aggressive", "balanced", "guardian"].includes(m)) return m;
+  return "balanced";
+}
+
+function modeTitle(mode) {
+  const m = safeMode(mode);
+  if (m === "aggressive") return "Aggressive";
+  if (m === "guardian") return "Guardian";
+  return "Balanced";
+}
+
+async function ensureUserSettings(userId) {
+  const ts = nowTs();
+  await run(
+    `INSERT OR IGNORE INTO user_settings (user_id, created_at, updated_at) VALUES (?, ?, ?)`,
+    [String(userId), ts, ts]
+  );
+}
+
+async function getUserSettings(userId) {
+  await ensureUserSettings(userId);
+  const row = await get(`SELECT * FROM user_settings WHERE user_id = ?`, [String(userId)]);
+  return row || {
+    user_id: String(userId),
+    mode: "balanced",
+    alerts_enabled: 1,
+    launch_alerts: 1,
+    smart_alerts: 1,
+    risk_alerts: 1,
+    whale_alerts: 1,
+    explanation_level: "deep"
+  };
+}
+
+async function setUserSetting(userId, field, value) {
+  const allowed = new Set([
+    "mode",
+    "alerts_enabled",
+    "launch_alerts",
+    "smart_alerts",
+    "risk_alerts",
+    "whale_alerts",
+    "explanation_level"
+  ]);
+  if (!allowed.has(field)) throw new Error(`Invalid setting field: ${field}`);
+  await ensureUserSettings(userId);
+  await run(
+    `UPDATE user_settings SET ${field} = ?, updated_at = ? WHERE user_id = ?`,
+    [value, nowTs(), String(userId)]
+  );
+}
+
+function getMemoryKey(pair) {
+  const chain = String(pair?.chainId || '').toLowerCase();
+  const token = String(pair?.baseAddress || pair?.pairAddress || '').toLowerCase();
+  return `${chain}:${token}`;
+}
+
+async function getPairMemory(pair) {
+  const key = getMemoryKey(pair);
+  const row = await get(`SELECT * FROM pair_memory WHERE memory_key = ?`, [key]);
+  return row || {
+    memory_key: key,
+    learned_bias: 0,
+    positive_events: 0,
+    negative_events: 0,
+    last_outcome: "none",
+    last_price: 0,
+    last_liquidity: 0,
+    last_volume: 0,
+    last_seen_at: 0
+  };
+}
+
+async function savePairMemorySnapshot(pair, verdictScore = null) {
+  const key = getMemoryKey(pair);
+  const old = await getPairMemory(pair);
+  const price = num(pair?.priceUsd);
+  const liquidity = num(pair?.liquidityUsd);
+  const volume = num(pair?.volumeH24);
+  let learnedBias = num(old.learned_bias);
+  let positive = num(old.positive_events);
+  let negative = num(old.negative_events);
+  let outcome = old.last_outcome || "none";
+
+  if (num(old.last_seen_at) > 0) {
+    const priceDelta = old.last_price > 0 ? ((price - old.last_price) / old.last_price) * 100 : 0;
+    const liqDelta = old.last_liquidity > 0 ? ((liquidity - old.last_liquidity) / old.last_liquidity) * 100 : 0;
+    const volDelta = old.last_volume > 0 ? ((volume - old.last_volume) / old.last_volume) * 100 : 0;
+
+    let signal = 0;
+    if (priceDelta >= 8) signal += 1;
+    if (liqDelta >= 10) signal += 1;
+    if (volDelta >= 15) signal += 1;
+    if (priceDelta <= -12) signal -= 1;
+    if (liqDelta <= -18) signal -= 1;
+
+    if (signal >= 2) {
+      learnedBias = Math.min(8, learnedBias + 1.25);
+      positive += 1;
+      outcome = "improving";
+    } else if (signal <= -2) {
+      learnedBias = Math.max(-10, learnedBias - 1.5);
+      negative += 1;
+      outcome = "weakening";
+    }
+  }
+
+  await run(
+    `INSERT INTO pair_memory (memory_key, learned_bias, positive_events, negative_events, last_outcome, last_price, last_liquidity, last_volume, last_seen_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(memory_key) DO UPDATE SET
+       learned_bias = excluded.learned_bias,
+       positive_events = excluded.positive_events,
+       negative_events = excluded.negative_events,
+       last_outcome = excluded.last_outcome,
+       last_price = excluded.last_price,
+       last_liquidity = excluded.last_liquidity,
+       last_volume = excluded.last_volume,
+       last_seen_at = excluded.last_seen_at,
+       updated_at = excluded.updated_at`,
+    [key, learnedBias, positive, negative, outcome, price, liquidity, volume, nowTs(), nowTs()]
+  );
+
+  return { learnedBias, positive, negative, outcome, verdictScore };
+}
+
+async function addScanFeedback(userId, pair, feedback, scoreSnapshot = 0) {
+  await run(
+    `INSERT INTO scan_feedback (user_id, chain_id, token_address, pair_address, symbol, feedback, score_snapshot, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      String(userId),
+      String(pair?.chainId || ''),
+      String(pair?.baseAddress || ''),
+      String(pair?.pairAddress || ''),
+      String(pair?.baseSymbol || ''),
+      String(feedback || ''),
+      num(scoreSnapshot),
+      nowTs()
+    ]
+  );
+
+  const current = await getPairMemory(pair);
+  let learnedBias = num(current.learned_bias);
+  let positive = num(current.positive_events);
+  let negative = num(current.negative_events);
+  let outcome = current.last_outcome || 'none';
+
+  if (feedback === 'good') {
+    learnedBias = Math.min(10, learnedBias + 2);
+    positive += 1;
+    outcome = 'user_confirmed_good';
+  } else if (feedback === 'bad') {
+    learnedBias = Math.max(-12, learnedBias - 2.5);
+    negative += 1;
+    outcome = 'user_confirmed_bad';
+  }
+
+  await run(
+    `INSERT INTO pair_memory (memory_key, learned_bias, positive_events, negative_events, last_outcome, last_price, last_liquidity, last_volume, last_seen_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(memory_key) DO UPDATE SET
+       learned_bias = excluded.learned_bias,
+       positive_events = excluded.positive_events,
+       negative_events = excluded.negative_events,
+       last_outcome = excluded.last_outcome,
+       updated_at = excluded.updated_at`,
+    [getMemoryKey(pair), learnedBias, positive, negative, outcome, num(current.last_price), num(current.last_liquidity), num(current.last_volume), num(current.last_seen_at), nowTs()]
+  );
+}
+
+async function addWatchlistItem(chatId, pair) {
+  const ts = nowTs();
+  await run(
+    `INSERT INTO watchlist (chat_id, chain_id, token_address, symbol, pair_address, active, alerts_enabled, added_price, last_price, last_liquidity, last_volume, last_score, last_alert_ts, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, 1, 1, ?, ?, ?, ?, 0, 0, ?, ?)
+     ON CONFLICT(chat_id, chain_id, token_address) DO UPDATE SET
+       symbol = excluded.symbol,
+       pair_address = excluded.pair_address,
+       last_price = excluded.last_price,
+       last_liquidity = excluded.last_liquidity,
+       last_volume = excluded.last_volume,
+       updated_at = excluded.updated_at,
+       active = 1`,
+    [
+      String(chatId),
+      String(pair.chainId || ''),
+      String(pair.baseAddress || ''),
+      String(pair.baseSymbol || ''),
+      String(pair.pairAddress || ''),
+      num(pair.priceUsd),
+      num(pair.priceUsd),
+      num(pair.liquidityUsd),
+      num(pair.volumeH24),
+      ts,
+      ts
+    ]
+  );
+}
+
+async function removeWatchlistItem(chatId, chainId, tokenAddress) {
+  await run(`DELETE FROM watchlist WHERE chat_id = ? AND chain_id = ? AND token_address = ?`, [String(chatId), String(chainId), String(tokenAddress)]);
+}
+
+async function getWatchlistItems(chatId) {
+  return await all(
+    `SELECT * FROM watchlist WHERE chat_id = ? AND active = 1 ORDER BY updated_at DESC LIMIT ?`,
+    [String(chatId), MAX_WATCHLIST_ITEMS]
+  );
+}
+
+async function getWatchlistCount(chatId) {
+  const row = await get(`SELECT COUNT(*) AS c FROM watchlist WHERE chat_id = ? AND active = 1`, [String(chatId)]);
+  return row?.c || 0;
+}
+
+function buildWatchlistItemCallback(chainId, tokenAddress) {
+  return `watch_open:${compactChainId(chainId)}:${String(tokenAddress)}`;
+}
+
+function explainBias(memory) {
+  const bias = num(memory?.learned_bias);
+  if (bias >= 5) return "Adaptive memory strongly positive";
+  if (bias >= 2) return "Adaptive memory slightly positive";
+  if (bias <= -5) return "Adaptive memory strongly negative";
+  if (bias <= -2) return "Adaptive memory slightly negative";
+  return "Adaptive memory neutral";
+}
+
 async function isUserSubscribed(userId) {
   try {
     const member = await bot.getChatMember(REQUIRED_CHANNEL, userId);
@@ -431,9 +869,18 @@ function buildMainMenu() {
       { text: "⭐ Prime Picks", callback_data: "prime_picks" }
     ],
     [
-      { text: "🐋 Whale Tracker", callback_data: "whale_menu" },
-      { text: "❓ Help", callback_data: "help_menu" }
-    ]
+      { text: "👁 Watchlist", callback_data: "watchlist" },
+      { text: "🧬 Mode Lab", callback_data: "mode_lab" }
+    ],
+    [
+      { text: "🚨 Alert Center", callback_data: "alert_center" },
+      { text: "🐋 Whale Tracker", callback_data: "whale_menu" }
+    ],
+    [
+      { text: "🧠 Edge Brain", callback_data: "edge_brain" },
+      { text: "🤖 AI Assistant", callback_data: "ai_assistant" }
+    ],
+    [{ text: "❓ Help", callback_data: "help_menu" }]
   ];
 
   if (growthRow.length) keyboard.push(growthRow);
@@ -449,11 +896,34 @@ function buildHelpMenu() {
   return {
     reply_markup: {
       inline_keyboard: [
-        [{ text: "📊 System Status", callback_data: "help_status" }],
-        [{ text: "📖 How To Use", callback_data: "help_how" }],
+        [{ text: "📖 How Gorktimus Works", callback_data: "help_engine" }],
+        [{ text: "📊 Why It Differs From Dex", callback_data: "help_dex_diff" }],
+        [{ text: "🛡 Safety Score + Confidence", callback_data: "help_score" }],
+        [{ text: "🔄 Transactions / Flow Explained", callback_data: "help_transactions" }],
         [{ text: "⚙️ Data Sources", callback_data: "help_sources" }],
         [{ text: "💬 Contact / Community", callback_data: "help_community" }],
         [{ text: "🏠 Main Menu", callback_data: "main_menu" }]
+      ]
+    }
+  };
+}
+
+function buildAIAssistantMenu() {
+  return {
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "📖 How It Works", callback_data: "help_engine" },
+          { text: "📊 Why Not Dex", callback_data: "help_dex_diff" }
+        ],
+        [
+          { text: "🔄 Transactions", callback_data: "help_transactions" },
+          { text: "🛡 Safety Score", callback_data: "help_score" }
+        ],
+        [
+          { text: "🔎 Scan Token", callback_data: "scan_token" },
+          { text: "🏠 Exit Assistant", callback_data: "main_menu" }
+        ]
       ]
     }
   };
@@ -475,6 +945,89 @@ function buildWhaleMenu() {
           { text: "🔍 Check Wallet", callback_data: "check_wallet" },
           { text: "⚙️ Alert Settings", callback_data: "wallet_alert_settings" }
         ],
+        [{ text: "🏠 Main Menu", callback_data: "main_menu" }]
+      ]
+    }
+  };
+}
+
+function buildModeMenu(currentMode) {
+  const mode = safeMode(currentMode);
+  const mark = (name, title) => ({
+    text: mode === name ? `✅ ${title}` : title,
+    callback_data: `set_mode:${name}`
+  });
+  return {
+    reply_markup: {
+      inline_keyboard: [
+        [mark("aggressive", "A — Aggressive")],
+        [mark("balanced", "B — Balanced")],
+        [mark("guardian", "C — Guardian")],
+        [{ text: "🏠 Main Menu", callback_data: "main_menu" }]
+      ]
+    }
+  };
+}
+
+function buildAlertCenterMenu(settings) {
+  const mark = (v) => (num(v) ? "✅" : "❌");
+  return {
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: `${mark(settings.alerts_enabled)} Master Alerts`, callback_data: "toggle_setting:alerts_enabled" }],
+        [
+          { text: `${mark(settings.launch_alerts)} Launch Alerts`, callback_data: "toggle_setting:launch_alerts" },
+          { text: `${mark(settings.smart_alerts)} Smart Alerts`, callback_data: "toggle_setting:smart_alerts" }
+        ],
+        [
+          { text: `${mark(settings.risk_alerts)} Risk Alerts`, callback_data: "toggle_setting:risk_alerts" },
+          { text: `${mark(settings.whale_alerts)} Whale Alerts`, callback_data: "toggle_setting:whale_alerts" }
+        ],
+        [{ text: "🏠 Main Menu", callback_data: "main_menu" }]
+      ]
+    }
+  };
+}
+
+function buildWatchlistMenu(rows) {
+  const buttons = rows.slice(0, MAX_WATCHLIST_ITEMS).map((row) => [{
+    text: `👁 ${clip(row.symbol || shortAddr(row.token_address, 6), 28)}`,
+    callback_data: buildWatchlistItemCallback(row.chain_id, row.token_address)
+  }]);
+  buttons.push([{ text: "🏠 Main Menu", callback_data: "main_menu" }]);
+  return { reply_markup: { inline_keyboard: buttons } };
+}
+
+function buildWatchlistItemMenu(pair) {
+  return {
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: "🔁 Re-Scan", callback_data: `watch_rescan:${compactChainId(pair.chainId)}:${pair.baseAddress}` }],
+        [{ text: "❌ Remove", callback_data: `watch_remove:${compactChainId(pair.chainId)}:${pair.baseAddress}` }],
+        [
+          { text: "👍 Good Call", callback_data: `feedback:g:${compactChainId(pair.chainId)}:${pair.baseAddress}` },
+          { text: "👎 Bad Call", callback_data: `feedback:b:${compactChainId(pair.chainId)}:${pair.baseAddress}` }
+        ],
+        [{ text: "👁 Watchlist", callback_data: "watchlist" }],
+        [{ text: "🏠 Main Menu", callback_data: "main_menu" }]
+      ]
+    }
+  };
+}
+
+function buildScanActionButtons(pair) {
+  return {
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "👁 Add Watchlist", callback_data: `watch_add:${compactChainId(pair.chainId)}:${pair.baseAddress}` },
+          { text: "🔎 Scan Another", callback_data: "scan_token" }
+        ],
+        [
+          { text: "👍 Good Call", callback_data: `feedback:g:${compactChainId(pair.chainId)}:${pair.baseAddress}` },
+          { text: "👎 Bad Call", callback_data: `feedback:b:${compactChainId(pair.chainId)}:${pair.baseAddress}` }
+        ],
+        [{ text: "🤖 Ask AI Assistant", callback_data: "ai_assistant" }],
         [{ text: "🏠 Main Menu", callback_data: "main_menu" }]
       ]
     }
@@ -639,7 +1192,6 @@ async function sendText(chatId, text, keyboard) {
 async function sendCard(chatId, text, keyboard = {}, imageUrl = "") {
   const safeText = text || "🧠 <b>Gorktimus Intelligence Terminal</b>";
 
-  // Telegram captions are much shorter than normal messages.
   if (safeText.length > 900) {
     await sendText(chatId, safeText, keyboard);
     return;
@@ -660,6 +1212,8 @@ async function sendCard(chatId, text, keyboard = {}, imageUrl = "") {
 
   await sendText(chatId, safeText, keyboard);
 }
+
+// ================= DEX HELPERS =================
 
 // ================= DEX HELPERS =================
 function rankPairQuality(pair) {
@@ -840,38 +1394,73 @@ async function fetchTokenProfileImage(chainId, tokenAddress, fallbackPair = null
 // ================= CHAIN INTELLIGENCE =================
 async function fetchHeliusTokenLargestAccounts(mintAddress) {
   if (!hasHelius() || !mintAddress) return [];
+
+  const cacheKey = String(mintAddress).trim();
+  const cached = heliusLargestAccountsCache.get(cacheKey);
+  if (cached && Date.now() - cached.ts < HELIUS_CACHE_TTL_MS) {
+    return cached.rows;
+  }
+
   if (Date.now() < heliusCooldownUntil) {
-    return [];
+    return cached?.rows || [];
   }
 
   try {
     const rpcUrl = `https://mainnet.helius-rpc.com/?api-key=${encodeURIComponent(HELIUS_API_KEY)}`;
-    const data = await rpcPost(rpcUrl, {
-      jsonrpc: "2.0",
-      id: "gork-largest-accounts",
-      method: "getTokenLargestAccounts",
-      params: [mintAddress]
-    });
+    const data = await retryOperation(
+      "fetchHeliusTokenLargestAccounts",
+      async () => {
+        const out = await rpcPost(rpcUrl, {
+          jsonrpc: "2.0",
+          id: "gork-largest-accounts",
+          method: "getTokenLargestAccounts",
+          params: [mintAddress]
+        });
+
+        if (!Array.isArray(out?.result?.value)) {
+          throw new Error("Largest accounts payload missing");
+        }
+
+        return out;
+      },
+      {
+        attempts: 3,
+        baseDelay: 1200,
+        maxDelay: 8000,
+        backoff: 2,
+        shouldRetry: (err) => {
+          const status = err?.response?.status;
+          return [408, 425, 429, 500, 502, 503, 504].includes(status) ||
+            err?.code === "ECONNABORTED" ||
+            err?.code === "ETIMEDOUT" ||
+            err?.code === "ECONNRESET";
+        },
+        onRetry: (err, attempt, delay) => {
+          console.log(
+            `fetchHeliusTokenLargestAccounts retry ${attempt} in ${delay}ms:`,
+            err?.response?.status || err.message
+          );
+        }
+      }
+    );
 
     heliusCooldownUntil = 0;
-
     const rows = Array.isArray(data?.result?.value) ? data.result.value : [];
-    return rows.map((x) => ({
+    const mapped = rows.map((x) => ({
       address: String(x.address || ""),
       amountRaw: String(x.amount || "0"),
       uiAmount: num(x.uiAmountString ?? x.uiAmount ?? 0),
       decimals: num(x.decimals, 0)
     }));
+    heliusLargestAccountsCache.set(cacheKey, { ts: Date.now(), rows: mapped });
+    return mapped;
   } catch (err) {
-    const status = err?.response?.status || err?.status;
+    const status = err?.response?.status;
     if (status === 429) {
       heliusCooldownUntil = Date.now() + HELIUS_COOLDOWN_MS;
-      console.log("fetchHeliusTokenLargestAccounts cooldown 60s due to 429");
-      return [];
     }
-
-    console.log("fetchHeliusTokenLargestAccounts error:", err.message);
-    return [];
+    console.log("fetchHeliusTokenLargestAccounts error:", err?.response?.status || err.message);
+    return cached?.rows || [];
   }
 }
 
@@ -942,43 +1531,123 @@ function analyzeSolanaHolderConcentration(largestAccounts = []) {
 async function fetchEvmHoneypot(address, chainId) {
   if (!address || !isEvmChain(chainId)) return null;
 
-  try {
-    const chain = String(chainId).toLowerCase();
-    const url = `${HONEYPOT_API_BASE}/v2/IsHoneypot`;
+  const chain = String(chainId).toLowerCase();
+  const mappedChainId = EVM_CHAIN_IDS[chain];
 
-    const res = await axios.get(url, {
-      timeout: DEX_TIMEOUT_MS,
-      params: {
-        address,
-        chainID: EVM_CHAIN_IDS[chain]
-      }
-    });
+  const strategies = [
+    async () => {
+      const res = await axios.get(`${HONEYPOT_API_BASE}/v2/IsHoneypot`, {
+        timeout: DEX_TIMEOUT_MS,
+        params: { address, chainID: mappedChainId }
+      });
+      return res.data || null;
+    },
+    async () => {
+      const res = await axios.get(`${HONEYPOT_API_BASE}/v2/IsHoneypot`, {
+        timeout: DEX_TIMEOUT_MS,
+        params: { address }
+      });
+      return res.data || null;
+    },
+    async () => {
+      const res = await axios.get(`${HONEYPOT_API_BASE}/IsHoneypot`, {
+        timeout: DEX_TIMEOUT_MS,
+        params: { address, chainID: mappedChainId }
+      });
+      return res.data || null;
+    }
+  ];
 
-    return res.data || null;
-  } catch (err) {
-    console.log("fetchEvmHoneypot error:", err.message);
-    return null;
+  let lastErr = null;
+
+  for (let i = 0; i < strategies.length; i++) {
+    try {
+      return await retryOperation(
+        `fetchEvmHoneypot:${i + 1}`,
+        async () => {
+          const result = await strategies[i]();
+          if (!result) throw new Error("Empty honeypot payload");
+          return result;
+        },
+        {
+          attempts: 3,
+          baseDelay: 850,
+          maxDelay: 5000,
+          backoff: 1.7,
+          shouldRetry: (err) => {
+            const status = err?.response?.status;
+            return [408, 425, 429, 500, 502, 503, 504].includes(status) ||
+              err?.code === "ECONNABORTED" ||
+              err?.code === "ETIMEDOUT" ||
+              err?.code === "ECONNRESET";
+          },
+          onRetry: (err, attempt, delay) => {
+            console.log(
+              `fetchEvmHoneypot strategy ${i + 1} retry ${attempt} in ${delay}ms:`,
+              err?.response?.status || err.message
+            );
+          }
+        }
+      );
+    } catch (err) {
+      lastErr = err;
+      console.log(
+        `fetchEvmHoneypot strategy ${i + 1} failed:`,
+        err?.response?.status || err.message
+      );
+    }
   }
+
+  if (lastErr) {
+    console.log("fetchEvmHoneypot final failure:", lastErr?.response?.status || lastErr.message);
+  }
+
+  return null;
 }
 
 async function fetchEvmTopHolders(address, chainId) {
   if (!address || !isEvmChain(chainId)) return null;
 
+  const chain = String(chainId).toLowerCase();
+  const mappedChainId = EVM_CHAIN_IDS[chain];
+
   try {
-    const chain = String(chainId).toLowerCase();
-    const url = `${HONEYPOT_API_BASE}/v1/TopHolders`;
+    return await retryOperation(
+      "fetchEvmTopHolders",
+      async () => {
+        const url = `${HONEYPOT_API_BASE}/v1/TopHolders`;
+        const res = await axios.get(url, {
+          timeout: DEX_TIMEOUT_MS,
+          params: {
+            address,
+            chainID: mappedChainId
+          }
+        });
 
-    const res = await axios.get(url, {
-      timeout: DEX_TIMEOUT_MS,
-      params: {
-        address,
-        chainID: EVM_CHAIN_IDS[chain]
+        return res.data || null;
+      },
+      {
+        attempts: 5,
+        baseDelay: 900,
+        maxDelay: 7000,
+        backoff: 1.8,
+        shouldRetry: (err) => {
+          const status = err?.response?.status;
+          return [408, 425, 429, 500, 502, 503, 504].includes(status) ||
+            err?.code === "ECONNABORTED" ||
+            err?.code === "ETIMEDOUT" ||
+            err?.code === "ECONNRESET";
+        },
+        onRetry: (err, attempt, delay) => {
+          console.log(
+            `fetchEvmTopHolders retry ${attempt} in ${delay}ms:`,
+            err?.response?.status || err.message
+          );
+        }
       }
-    });
-
-    return res.data || null;
+    );
   } catch (err) {
-    console.log("fetchEvmTopHolders error:", err.message);
+    console.log("fetchEvmTopHolders error:", err?.response?.status || err.message);
     return null;
   }
 }
@@ -1028,6 +1697,82 @@ function analyzeEvmTopHolders(data) {
     top10Pct,
     holdersKnown: holders.length,
     detail: `Top 1: ${toPct(top1Pct)} | Top 5: ${toPct(top5Pct)} | Top 10: ${toPct(top10Pct)}`
+  };
+}
+
+
+function analyzeExecutionBehavior(pair) {
+  const buys = num(pair?.buysM5);
+  const sells = num(pair?.sellsM5);
+  const txns = num(pair?.txnsM5);
+  const liquidity = num(pair?.liquidityUsd);
+  const volume = num(pair?.volumeH24);
+  const avgUsdPerRecentTxn = txns > 0 ? volume / Math.max(txns, 1) : volume;
+
+  let spamLabel = "No strong spam signature";
+  let coordinationLabel = "No obvious coordinated buy pattern";
+  let flowLabel = "Mixed recent flow";
+  let penalty = 0;
+  const notes = [];
+
+  if (buys > sells * 1.8 && txns >= 8) {
+    flowLabel = "Positive momentum pressure";
+  } else if (sells > buys * 1.4 && txns >= 8) {
+    flowLabel = "Distribution pressure";
+  }
+
+  if (txns >= 25 && liquidity < 25000 && avgUsdPerRecentTxn < 1500) {
+    spamLabel = "Possible transaction spam";
+    penalty += 4;
+    notes.push("Recent transaction count looks loud relative to thin liquidity and average size.");
+  }
+
+  if (buys >= 18 && sells <= 1 && liquidity < 25000) {
+    coordinationLabel = "Possible coordinated buy burst";
+    penalty += 5;
+    notes.push("Buy flow is extremely one-sided and can be manufactured in thin books.");
+  } else if (buys >= 12 && sells === 0 && liquidity < 15000) {
+    coordinationLabel = "Elevated coordinated-flow risk";
+    penalty += 3;
+    notes.push("Near one-way buys in thin liquidity deserve caution.");
+  }
+
+  if (!notes.length) {
+    notes.push("No dominant flow-manipulation signature from the current lightweight behavior checks.");
+  }
+
+  return {
+    spamLabel,
+    coordinationLabel,
+    flowLabel,
+    penalty,
+    detail: notes.join(" ")
+  };
+}
+
+function buildConfidenceMeta(sourceChecks, behaviorPenalty = 0) {
+  const available = num(sourceChecks?.available);
+  const expected = Math.max(1, num(sourceChecks?.expected, 1));
+  const ratio = available / expected;
+
+  let confidence = "Medium";
+  let integrity = "Partial";
+
+  if (ratio >= 0.9 && behaviorPenalty <= 2) {
+    confidence = "High";
+    integrity = "Verified";
+  } else if (ratio >= 0.6) {
+    confidence = "Medium";
+    integrity = behaviorPenalty >= 5 ? "Mixed" : "Partial";
+  } else {
+    confidence = "Low";
+    integrity = "Weak";
+  }
+
+  return {
+    confidence,
+    integrity,
+    checksText: `${available}/${expected} source checks`
   };
 }
 
@@ -1130,12 +1875,13 @@ function buildRecommendation(score, ageMin, pair, verdictMeta = {}) {
   return "Speculative setup. Treat this as a high-risk play until more data matures.";
 }
 
-async function buildRiskVerdict(pair) {
+async function buildRiskVerdict(pair, userId = null) {
   const ageMin = ageMinutesFromMs(pair.pairCreatedAt);
   const liquidity = getLiquidityHealth(pair.liquidityUsd);
   const age = getAgeRisk(ageMin);
   const flow = getFlowHealth(pair);
   const volume = getVolumeHealth(pair.volumeH24);
+  const behavior = analyzeExecutionBehavior(pair);
 
   let transparencyLabel = "Unknown";
   let transparencyEmoji = "⚠️";
@@ -1157,7 +1903,11 @@ async function buildRiskVerdict(pair) {
   let transferTax = null;
   let holderTop5Pct = 0;
   let isHoneypot = null;
+  let sourceChecks = { available: 1, expected: 3 };
 
+  const settings = userId ? await getUserSettings(userId) : { mode: "balanced" };
+  const mode = safeMode(settings?.mode);
+  const memory = await getPairMemory(pair);
   const chain = String(pair.chainId || "").toLowerCase();
 
   if (chain === "solana") {
@@ -1194,7 +1944,12 @@ async function buildRiskVerdict(pair) {
     honeypotLabel = "Not Fully Testable";
     honeypotEmoji = "⚠️";
     honeypotScore = 8;
-    honeypotDetail = "Solana honeypot simulation not fully supported in this stack yet";
+    honeypotDetail = "Solana honeypot simulation is limited in this stack, so safety is inferred more from structure than direct trap simulation.";
+
+    sourceChecks = {
+      available: 1 + (largestAccounts.length ? 1 : 0) + 1,
+      expected: 3
+    };
   } else if (isEvmChain(chain)) {
     const [honeypotData, topHoldersData, etherscanData] = await Promise.all([
       fetchEvmHoneypot(pair.baseAddress, chain),
@@ -1309,6 +2064,15 @@ async function buildRiskVerdict(pair) {
         ? "Explorer verification response unavailable"
         : "Set ETHERSCAN_API_KEY for contract verification fallback";
     }
+
+    sourceChecks = {
+      available:
+        1 +
+        (honeypotData ? 1 : 0) +
+        (topHoldersData ? 1 : 0) +
+        (honeypotData?.contractCode || etherscanData ? 1 : 0),
+      expected: 4
+    };
   }
 
   let rawScore =
@@ -1320,8 +2084,23 @@ async function buildRiskVerdict(pair) {
     honeypotScore +
     holderScore;
 
+  rawScore -= behavior.penalty;
+
+  if (mode === "aggressive") {
+    rawScore += ageMin > 0 && ageMin < 120 ? 6 : 0;
+    rawScore += num(pair.buysM5) > num(pair.sellsM5) ? 4 : 0;
+    rawScore -= num(pair.liquidityUsd) < 15000 ? 2 : 0;
+  } else if (mode === "guardian") {
+    rawScore -= num(pair.liquidityUsd) < 25000 ? 6 : 0;
+    rawScore -= holderTop5Pct >= 70 ? 8 : 0;
+    rawScore -= isHoneypot === true ? 12 : 0;
+    rawScore -= ageMin > 0 && ageMin < 30 ? 4 : 0;
+  }
+
+  rawScore += clamp(num(memory.learned_bias), -12, 10);
   rawScore = Math.max(0, Math.min(100, Math.round(rawScore)));
 
+  const confidenceMeta = buildConfidenceMeta(sourceChecks, behavior.penalty);
   const recommendation = buildRecommendation(rawScore, ageMin, pair, {
     isHoneypot,
     buyTax,
@@ -1342,7 +2121,17 @@ async function buildRiskVerdict(pair) {
     transferTax,
     holderDetail,
     transparencyDetail,
-    honeypotDetail
+    honeypotDetail,
+    memoryBias: num(memory.learned_bias),
+    memoryNote: explainBias(memory),
+    modeTitle: modeTitle(mode),
+    confidence: confidenceMeta.confidence,
+    integrity: confidenceMeta.integrity,
+    sourceChecks: confidenceMeta.checksText,
+    flowBehavior: behavior.flowLabel,
+    spamSignal: behavior.spamLabel,
+    coordinationSignal: behavior.coordinationLabel,
+    behaviorDetail: behavior.detail
   };
 }
 
@@ -1366,9 +2155,9 @@ function clickableAddressLine(pair) {
   return `📍 Address: <a href="${dex}">${addrText}</a>`;
 }
 
-async function buildScanCard(pair, title = "🔎 Token Scan") {
+async function buildScanCard(pair, title = "🔎 Token Scan", userId = null) {
   const ageLabel = ageFromMs(pair.pairCreatedAt);
-  const verdict = await buildRiskVerdict(pair);
+  const verdict = await buildRiskVerdict(pair, userId);
 
   const lines = [
     `🧠 <b>Gorktimus Intelligence Terminal</b>`,
@@ -1381,11 +2170,21 @@ async function buildScanCard(pair, title = "🔎 Token Scan") {
     `⛓️ <b>Chain:</b> ${escapeHtml(humanChain(pair.chainId))}`,
     `⏱️ <b>Age:</b> ${escapeHtml(ageLabel)}`,
     ``,
-    `🧠 <b>Gorktimus Risk Verdict</b>`,
+    `🧠 <b>Risk Verdict</b>`,
     `⚠️ <b>Honeypot Check:</b> ${escapeHtml(verdict.honeypot)}`,
     `🔍 <b>Contract Transparency:</b> ${escapeHtml(verdict.transparency)}`,
     `👥 <b>Holder Concentration:</b> ${escapeHtml(verdict.holders)}`,
     `💧 <b>Liquidity Health:</b> ${escapeHtml(verdict.liquidity)}`,
+    ``,
+    `🧬 <b>Flow + Confidence</b>`,
+    `📊 <b>Safety Score:</b> ${escapeHtml(String(verdict.score))} / 100`,
+    `🛡 <b>Confidence:</b> ${escapeHtml(verdict.confidence)}`,
+    `🧾 <b>Data Integrity:</b> ${escapeHtml(verdict.integrity)}`,
+    `🔗 <b>Cross-Source Checks:</b> ${escapeHtml(verdict.sourceChecks)}`,
+    `🌊 <b>Flow Read:</b> ${escapeHtml(verdict.flowBehavior)}`,
+    `🛰 <b>Tx Spam Signal:</b> ${escapeHtml(verdict.spamSignal)}`,
+    `🎯 <b>Coordination Signal:</b> ${escapeHtml(verdict.coordinationSignal)}`,
+    verdict.behaviorDetail ? `🧠 <b>Behavior Note:</b> ${escapeHtml(verdict.behaviorDetail)}` : "",
     ``,
     verdict.buyTax !== null || verdict.sellTax !== null || verdict.transferTax !== null
       ? `🧾 <b>Taxes:</b> Buy ${escapeHtml(
@@ -1402,7 +2201,8 @@ async function buildScanCard(pair, title = "🔎 Token Scan") {
       ? `📜 <b>Code Detail:</b> ${escapeHtml(verdict.transparencyDetail)}`
       : "",
     ``,
-    `📊 <b>Safety Score:</b> ${escapeHtml(String(verdict.score))} / 100`,
+    `🧬 <b>Mode:</b> ${escapeHtml(verdict.modeTitle || "Balanced")}`,
+    `🧠 <b>Adaptive Memory:</b> ${escapeHtml(verdict.memoryNote || "Neutral")}`,
     ``,
     `📢 <b>Recommendation:</b> ${escapeHtml(verdict.recommendation)}`,
     ``,
@@ -1411,7 +2211,6 @@ async function buildScanCard(pair, title = "🔎 Token Scan") {
     `💧 <b>Liquidity:</b> ${escapeHtml(shortUsd(pair.liquidityUsd))}`,
     `📊 <b>Market Cap:</b> ${escapeHtml(shortUsd(pair.marketCap || pair.fdv))}`,
     `📈 <b>Volume 24h:</b> ${escapeHtml(shortUsd(pair.volumeH24))}`,
-    ``,
     `🟢 <b>Buys:</b> ${escapeHtml(String(pair.buysM5))}`,
     `🔴 <b>Sells:</b> ${escapeHtml(String(pair.sellsM5))}`,
     `🔄 <b>Transactions:</b> ${escapeHtml(String(pair.txnsM5))}`,
@@ -1438,9 +2237,9 @@ function buildLaunchVerdict(pair) {
   return "🧠 Verdict: This token has been trading long enough to show a more stable market profile than most fresh launches.";
 }
 
-async function buildLaunchCard(pair, rank = 0) {
+async function buildLaunchCard(pair, rank = 0, userId = null) {
   const title = rank > 0 ? `📡 Launch Radar #${rank}` : "📡 Launch Radar";
-  const verdict = await buildRiskVerdict(pair);
+  const verdict = await buildRiskVerdict(pair, userId);
 
   const lines = [
     `🧠 <b>Gorktimus Intelligence Terminal</b>`,
@@ -1453,315 +2252,30 @@ async function buildLaunchCard(pair, rank = 0) {
     `⛓️ <b>Chain:</b> ${escapeHtml(humanChain(pair.chainId))}`,
     `⏱️ <b>Age:</b> ${escapeHtml(ageFromMs(pair.pairCreatedAt))}`,
     ``,
-    `🧠 <b>Gorktimus Risk Verdict</b>`,
+    `📡 <b>Launch Read</b>`,
+    `${escapeHtml(buildLaunchVerdict(pair))}`,
+    ``,
+    `📊 <b>Safety Score:</b> ${escapeHtml(String(verdict.score))} / 100`,
+    `🛡 <b>Confidence:</b> ${escapeHtml(verdict.confidence)}`,
+    `🧾 <b>Data Integrity:</b> ${escapeHtml(verdict.integrity)}`,
+    `🌊 <b>Flow Read:</b> ${escapeHtml(verdict.flowBehavior)}`,
+    `🛰 <b>Tx Spam Signal:</b> ${escapeHtml(verdict.spamSignal)}`,
+    `🎯 <b>Coordination Signal:</b> ${escapeHtml(verdict.coordinationSignal)}`,
+    ``,
     `⚠️ <b>Honeypot Check:</b> ${escapeHtml(verdict.honeypot)}`,
     `🔍 <b>Contract Transparency:</b> ${escapeHtml(verdict.transparency)}`,
     `👥 <b>Holder Concentration:</b> ${escapeHtml(verdict.holders)}`,
     `💧 <b>Liquidity Health:</b> ${escapeHtml(verdict.liquidity)}`,
     ``,
-    verdict.buyTax !== null || verdict.sellTax !== null || verdict.transferTax !== null
-      ? `🧾 <b>Taxes:</b> Buy ${escapeHtml(
-          verdict.buyTax !== null ? `${verdict.buyTax}%` : "N/A"
-        )} | Sell ${escapeHtml(
-          verdict.sellTax !== null ? `${verdict.sellTax}%` : "N/A"
-        )} | Transfer ${escapeHtml(
-          verdict.transferTax !== null ? `${verdict.transferTax}%` : "N/A"
-        )}`
-      : "",
-    verdict.honeypotDetail ? `🧪 <b>Simulation:</b> ${escapeHtml(verdict.honeypotDetail)}` : "",
-    verdict.holderDetail ? `📦 <b>Holder Detail:</b> ${escapeHtml(verdict.holderDetail)}` : "",
-    verdict.transparencyDetail
-      ? `📜 <b>Code Detail:</b> ${escapeHtml(verdict.transparencyDetail)}`
-      : "",
-    ``,
-    `📊 <b>Safety Score:</b> ${escapeHtml(String(verdict.score))} / 100`,
-    ``,
     `📢 <b>Recommendation:</b> ${escapeHtml(verdict.recommendation)}`,
     ``,
-    `📈 <b>Market Data</b>`,
     `💲 <b>Price:</b> ${escapeHtml(shortUsd(pair.priceUsd))}`,
     `💧 <b>Liquidity:</b> ${escapeHtml(shortUsd(pair.liquidityUsd))}`,
-    `📊 <b>Market Cap:</b> ${escapeHtml(shortUsd(pair.marketCap || pair.fdv))}`,
     `📈 <b>Volume 24h:</b> ${escapeHtml(shortUsd(pair.volumeH24))}`,
-    ``,
-    `🟢 <b>Buys:</b> ${escapeHtml(String(pair.buysM5))}`,
-    `🔴 <b>Sells:</b> ${escapeHtml(String(pair.sellsM5))}`,
-    `🔄 <b>Transactions:</b> ${escapeHtml(String(pair.txnsM5))}`,
-    ``,
-    buildLaunchVerdict(pair),
-    ``,
-    clickableAddressLine(pair),
-    ``,
-    `🔗 <b>Data Sources</b>`,
-    ...buildSourceLines(pair)
+    clickableAddressLine(pair)
   ].filter(Boolean);
 
   return lines.join("\n");
-}
-
-function buildTrendingLine(pair, idx) {
-  const dex = makeDexUrl(pair.chainId, pair.pairAddress, pair.url);
-  return `${idx}️⃣ <b>${escapeHtml(pair.baseSymbol || "Unknown")}</b> | ${escapeHtml(
-    humanChain(pair.chainId)
-  )} | ⏱️ ${escapeHtml(ageFromMs(pair.pairCreatedAt))} | 💧 ${escapeHtml(
-    shortUsd(pair.liquidityUsd)
-  )} | 📈 ${escapeHtml(shortUsd(pair.volumeH24))} | 🟢 ${escapeHtml(
-    String(pair.buysM5)
-  )} | 🔴 ${escapeHtml(String(pair.sellsM5))}${dex ? ` | <a href="${dex}">DexScreener</a>` : ""}`;
-}
-// ================= GORKTIMUS NETWORK PULSE =================
-async function trackUserActivity(userId) {
-  await run(
-    `INSERT INTO user_activity (user_id, ts) VALUES (?, ?)`,
-    [String(userId), nowTs()]
-  );
-}
-
-async function trackScan(userId) {
-  await run(
-    `INSERT INTO scan_logs (user_id, ts) VALUES (?, ?)`,
-    [String(userId), nowTs()]
-  );
-}
-
-async function getNetworkPulse() {
-  const now = nowTs();
-  const startOfDay = now - 86400;
-  const liveWindow = now - 900; // 15 min
-
-  const todayUsers = await get(
-    `SELECT COUNT(DISTINCT user_id) as c FROM user_activity WHERE ts >= ?`,
-    [startOfDay]
-  );
-
-  const liveUsers = await get(
-    `SELECT COUNT(DISTINCT user_id) as c FROM user_activity WHERE ts >= ?`,
-    [liveWindow]
-  );
-
-  const scansToday = await get(
-    `SELECT COUNT(*) as c FROM scan_logs WHERE ts >= ?`,
-    [startOfDay]
-  );
-
-  return `⚡ ${todayUsers?.c || 0} today • ${liveUsers?.c || 0} live • ${scansToday?.c || 0} scans`;
-}
-// ================= MARKET SCREENS =================
-async function showMainMenu(chatId) {
-  const pulse = await getNetworkPulse();
-
-  await sendMenu(
-    chatId,
-    `🧠 <b>Gorktimus Intelligence Terminal</b>\n\n${pulse}\n\nLive intelligence. On-demand execution.\nNo clutter. No spam.\n\nSelect an operation below.`,
-    buildMainMenu()
-  );
-}
-
-async function showHelpMenu(chatId) {
-  await sendMenu(
-    chatId,
-    `🧠 <b>Gorktimus Intelligence Terminal</b>\n\n❓ <b>Help Center</b>\nEverything below pulls live data when requested.`,
-    buildHelpMenu()
-  );
-}
-
-async function showWhaleMenu(chatId) {
-  await sendMenu(
-    chatId,
-    `🧠 <b>Gorktimus Intelligence Terminal</b>\n\n🐋 <b>Whale Tracker</b>\nTrack named wallets and monitor movement on demand or by wallet alerts.`,
-    buildWhaleMenu()
-  );
-}
-
-async function showInviteFriends(chatId) {
-  const botLink = buildBotDeepLink();
-
-  const text = [
-    `🧠 <b>Gorktimus Intelligence Terminal</b>`,
-    ``,
-    `🚀 <b>Invite Friends</b>`,
-    ``,
-    botLink
-      ? `Share this bot link:\n${escapeHtml(botLink)}`
-      : `Bot username not detected yet.`
-  ].join("\n");
-
-  await sendText(chatId, text, buildMainMenuOnlyButton());
-}
-
-async function promptScanToken(chatId) {
-  pendingAction.set(chatId, { type: "SCAN_TOKEN" });
-  await sendText(
-    chatId,
-    `🧠 <b>Gorktimus Intelligence Terminal</b>\n\n🔎 Send a token ticker, token address, or pair search.`,
-    buildMainMenuOnlyButton()
-  );
-}
-
-async function runTokenScan(chatId, query) {
-  const pair = await resolveBestPair(query);
-  if (!pair) {
-    await sendText(
-      chatId,
-      `🧠 <b>Gorktimus Intelligence Terminal</b>\n\n🔎 <b>Token Scan</b>\n\nNo solid token match was found for <b>${escapeHtml(
-        query
-      )}</b>.`,
-      buildScanButtons()
-    );
-    return;
-  }
-
-  const imageUrl = await fetchTokenProfileImage(pair.chainId, pair.baseAddress, pair);
-  await sendCard(chatId, await buildScanCard(pair, "🔎 Token Scan"), buildScanButtons(), imageUrl);
-}
-
-function pTrendScore(pair) {
-  const ageMin = ageMinutesFromMs(pair.pairCreatedAt);
-  const buyPressure = pair.buysM5 * 600;
-  const sellPenalty = pair.sellsM5 * 120;
-  const liq = pair.liquidityUsd * 1.8;
-  const vol = pair.volumeH24 * 2.3;
-  const freshnessBonus = Math.max(0, 300000 - ageMin * 350);
-
-  return liq + vol + buyPressure + freshnessBonus - sellPenalty;
-}
-
-async function buildTrendingCandidates(limit = 10) {
-  const profiles = await fetchLatestProfiles();
-  const boosts = await fetchLatestBoosts();
-  const merged = new Map();
-
-  for (const item of profiles) {
-    if (!item?.chainId || !item?.tokenAddress) continue;
-    if (!supportsChain(item.chainId)) continue;
-
-    merged.set(`${item.chainId}:${item.tokenAddress}`, {
-      chainId: String(item.chainId),
-      tokenAddress: String(item.tokenAddress)
-    });
-  }
-
-  for (const item of boosts) {
-    if (!item?.chainId || !item?.tokenAddress) continue;
-    if (!supportsChain(item.chainId)) continue;
-
-    merged.set(`${item.chainId}:${item.tokenAddress}`, {
-      chainId: String(item.chainId),
-      tokenAddress: String(item.tokenAddress)
-    });
-  }
-
-  const candidates = [];
-  for (const item of [...merged.values()].slice(0, 40)) {
-    const pair = await resolveTokenToBestPair(item.chainId, item.tokenAddress);
-    if (!pair) continue;
-    if (pair.liquidityUsd < 10000) continue;
-    if (pair.volumeH24 < 10000) continue;
-    if (pair.buysM5 + pair.sellsM5 < 3) continue;
-
-    pair._trendScore = pTrendScore(pair);
-    candidates.push(pair);
-  }
-
-  return candidates.sort((a, b) => b._trendScore - a._trendScore).slice(0, limit);
-}
-
-async function showTrending(chatId) {
-  let pairs = [];
-  try {
-    pairs = await buildTrendingCandidates(10);
-  } catch (err) {
-    console.log("showTrending fetch error:", err.message);
-  }
-
-  if (!pairs.length) {
-    await sendText(
-      chatId,
-      `🧠 <b>Gorktimus Intelligence Terminal</b>\n\n📈 <b>Trending</b>\n\nNo trending candidates were found right now.`,
-      buildRefreshMainButtons("trending")
-    );
-    return;
-  }
-
-  const lines = pairs.map((pair, i) => buildTrendingLine(pair, i + 1));
-  const text = [
-    `🧠 <b>Gorktimus Intelligence Terminal</b>`,
-    ``,
-    `📈 <b>Top 10 Trending</b> | ${buildGeneratedStamp()}`,
-    ``,
-    ...lines
-  ].join("\n");
-
-  await sendText(chatId, text, buildRefreshMainButtons("trending"));
-}
-
-async function buildLaunchCandidates(limit = 5) {
-  const profiles = await fetchLatestProfiles();
-  const boosts = await fetchLatestBoosts();
-  const merged = new Map();
-
-  for (const item of profiles) {
-    if (!item?.chainId || !item?.tokenAddress) continue;
-    if (!supportsChain(item.chainId)) continue;
-    const key = `${item.chainId}:${item.tokenAddress}`;
-    merged.set(key, {
-      chainId: String(item.chainId),
-      tokenAddress: String(item.tokenAddress)
-    });
-  }
-
-  for (const item of boosts) {
-    if (!item?.chainId || !item?.tokenAddress) continue;
-    if (!supportsChain(item.chainId)) continue;
-    const key = `${item.chainId}:${item.tokenAddress}`;
-    if (!merged.has(key)) {
-      merged.set(key, {
-        chainId: String(item.chainId),
-        tokenAddress: String(item.tokenAddress)
-      });
-    }
-  }
-
-  const candidates = [];
-  for (const item of [...merged.values()].slice(0, 30)) {
-    const pair = await resolveTokenToBestPair(item.chainId, item.tokenAddress);
-    if (!pair) continue;
-    if (pair.liquidityUsd < LAUNCH_MIN_LIQ_USD) continue;
-    if (pair.volumeH24 < LAUNCH_MIN_VOL_USD) continue;
-    if (!pair.pairCreatedAt) continue;
-    candidates.push(pair);
-  }
-
-  return candidates
-    .sort((a, b) => num(a.pairCreatedAt) - num(b.pairCreatedAt))
-    .slice(0, limit);
-}
-
-async function showLaunchRadar(chatId) {
-  const launches = await buildLaunchCandidates(5);
-
-  if (!launches.length) {
-    await sendText(
-      chatId,
-      `🧠 <b>Gorktimus Intelligence Terminal</b>\n\n📡 <b>Launch Radar</b>\n\nNo strong launch candidates were found right now.`,
-      buildRefreshMainButtons("launch_radar")
-    );
-    return;
-  }
-
-  for (let i = 0; i < launches.length; i++) {
-    const pair = launches[i];
-    const imageUrl = await fetchTokenProfileImage(pair.chainId, pair.baseAddress, pair);
-
-    await sendCard(
-      chatId,
-      await buildLaunchCard(pair, i + 1),
-      i === launches.length - 1 ? buildRefreshMainButtons("launch_radar") : {},
-      imageUrl
-    );
-
-    if (i < launches.length - 1) await sleep(250);
-  }
 }
 
 function primePickScore(pair) {
@@ -1843,7 +2357,7 @@ async function showPrimePicks(chatId) {
 
     await sendCard(
       chatId,
-      await buildScanCard(pair, `⭐ Prime Picks #${i + 1}`),
+      await buildScanCard(pair, `⭐ Prime Picks #${i + 1}`, chatId),
       i === picks.length - 1 ? buildRefreshMainButtons("prime_picks") : {},
       imageUrl
     );
@@ -1851,6 +2365,317 @@ async function showPrimePicks(chatId) {
     if (i < picks.length - 1) await sleep(250);
   }
 }
+
+async function getNetworkPulse() {
+  const now = nowTs();
+  const startOfDay = now - 86400;
+  const liveWindow = now - 900;
+
+  const todayUsers = await get(`SELECT COUNT(DISTINCT user_id) as c FROM user_activity WHERE ts >= ?`, [startOfDay]);
+  const liveUsers = await get(`SELECT COUNT(DISTINCT user_id) as c FROM user_activity WHERE ts >= ?`, [liveWindow]);
+  const scansToday = await get(`SELECT COUNT(*) as c FROM scan_logs WHERE ts >= ?`, [startOfDay]);
+
+  return `⚡ ${todayUsers?.c || 0} today • ${liveUsers?.c || 0} live • ${scansToday?.c || 0} scans`;
+}
+
+async function trackUserActivity(userId) {
+  await run(`INSERT INTO user_activity (user_id, ts) VALUES (?, ?)`, [String(userId), nowTs()]);
+}
+
+async function trackScan(userId) {
+  await run(`INSERT INTO scan_logs (user_id, ts) VALUES (?, ?)`, [String(userId), nowTs()]);
+}
+
+async function showMainMenu(chatId) {
+  const pulse = await getNetworkPulse();
+  await sendMenu(
+    chatId,
+    `🧠 <b>Gorktimus Intelligence Terminal</b>\n\n${pulse}\n\nLive intelligence. On-demand execution.\nNo clutter. No spam.\n\nSelect an operation below.`,
+    buildMainMenu()
+  );
+}
+
+async function showHelpMenu(chatId) {
+  await sendMenu(
+    chatId,
+    `🧠 <b>Gorktimus Intelligence Terminal</b>\n\n❓ <b>Help Center</b>\nEverything below pulls live data when requested.`,
+    buildHelpMenu()
+  );
+}
+
+async function showWhaleMenu(chatId) {
+  await sendMenu(
+    chatId,
+    `🧠 <b>Gorktimus Intelligence Terminal</b>\n\n🐋 <b>Whale Tracker</b>\nTrack named wallets and monitor movement on demand or by wallet alerts.`,
+    buildWhaleMenu()
+  );
+}
+
+async function resolveExactPairOrToken(chainId, tokenAddress) {
+  try {
+    const pair = await resolveTokenToBestPair(chainId, tokenAddress);
+    if (pair) return pair;
+  } catch (err) {
+    console.log("resolveExactPairOrToken best-pair warning:", err.message);
+  }
+
+  try {
+    const pairs = await fetchPairsByToken(chainId, tokenAddress);
+    if (pairs.length) return pairs.sort((a, b) => rankPairQuality(b) - rankPairQuality(a))[0];
+  } catch (err) {
+    console.log("resolveExactPairOrToken token-route error:", err.message);
+  }
+
+  return null;
+}
+
+async function runTokenScan(chatId, query) {
+  const pair = await resolveBestPair(query);
+  if (!pair) {
+    await sendText(
+      chatId,
+      `🧠 <b>Gorktimus Intelligence Terminal</b>\n\n🔎 <b>Token Scan</b>\n\nNo solid token match was found for <b>${escapeHtml(query)}</b>.`,
+      buildScanButtons()
+    );
+    return;
+  }
+
+  const imageUrl = await fetchTokenProfileImage(pair.chainId, pair.baseAddress, pair);
+  const verdict = await buildRiskVerdict(pair, chatId);
+  await savePairMemorySnapshot(pair, verdict.score);
+  await sendCard(chatId, await buildScanCard(pair, "🔎 Token Scan", chatId), buildScanActionButtons(pair), imageUrl);
+}
+
+function buildTrendingCompactLine(pair, rank = 0) {
+  const prefix = rank > 0 ? `#${rank} ` : "";
+  return [
+    `📈 <b>${prefix}${escapeHtml(safeSymbolText(pair.baseSymbol))}</b> — ${escapeHtml(humanChain(pair.chainId))}`,
+    `Price: ${escapeHtml(shortUsd(pair.priceUsd))} | Liq: ${escapeHtml(shortUsd(pair.liquidityUsd))} | Vol: ${escapeHtml(shortUsd(pair.volumeH24))}`,
+    `Age: ${escapeHtml(ageFromMs(pair.pairCreatedAt))} | Buys: ${escapeHtml(String(pair.buysM5))} | Sells: ${escapeHtml(String(pair.sellsM5))}`
+  ].join("\n");
+}
+
+function buildTrendingActionMenu(pair, isLast = false) {
+  const c = compactChainId(pair.chainId);
+  const rows = [
+    [
+      { text: `📋 ${clip(safeSymbolText(pair.baseSymbol), 18)}`, callback_data: `trend_copy:${c}:${pair.baseAddress}` },
+      { text: "🔎 Scan", callback_data: `trend_scan:${c}:${pair.baseAddress}` }
+    ],
+    [
+      { text: "⭐ Watch", callback_data: `watch_add:${c}:${pair.baseAddress}` },
+      { text: "📈 Dex", url: makeDexUrl(pair.chainId, pair.pairAddress, pair.url) || COMMUNITY_X_URL }
+    ]
+  ];
+  if (isLast) rows.push([{ text: "🏠 Main Menu", callback_data: "main_menu" }]);
+  return { reply_markup: { inline_keyboard: rows } };
+}
+
+async function buildTrendingCandidates(limit = 10) {
+  const profiles = await fetchLatestProfiles();
+  const boosts = await fetchLatestBoosts();
+  const merged = new Map();
+
+  for (const item of profiles) {
+    if (!item?.chainId || !item?.tokenAddress) continue;
+    if (!supportsChain(item.chainId)) continue;
+    merged.set(`${item.chainId}:${item.tokenAddress}`, {
+      chainId: String(item.chainId),
+      tokenAddress: String(item.tokenAddress)
+    });
+  }
+
+  for (const item of boosts) {
+    if (!item?.chainId || !item?.tokenAddress) continue;
+    if (!supportsChain(item.chainId)) continue;
+    merged.set(`${item.chainId}:${item.tokenAddress}`, {
+      chainId: String(item.chainId),
+      tokenAddress: String(item.tokenAddress)
+    });
+  }
+
+  const candidates = [];
+  for (const item of [...merged.values()].slice(0, 40)) {
+    const pair = await resolveTokenToBestPair(item.chainId, item.tokenAddress);
+    if (!pair) continue;
+    if (pair.liquidityUsd < 10000) continue;
+    if (pair.volumeH24 < 10000) continue;
+    if (pair.buysM5 + pair.sellsM5 < 3) continue;
+    pair._trendScore = pTrendScore(pair);
+    candidates.push(pair);
+  }
+
+  return candidates.sort((a, b) => b._trendScore - a._trendScore).slice(0, limit);
+}
+
+async function showTrending(chatId) {
+  let pairs = [];
+  try {
+    pairs = await buildTrendingCandidates(10);
+  } catch (err) {
+    console.log("showTrending fetch error:", err.message);
+  }
+
+  if (!pairs.length) {
+    await sendText(chatId, `🧠 <b>Gorktimus Intelligence Terminal</b>\n\n📈 <b>Trending</b>\n\nNo trending candidates were found right now.`, buildRefreshMainButtons("trending"));
+    return;
+  }
+
+  await sendText(
+    chatId,
+    [`🧠 <b>Gorktimus Intelligence Terminal</b>`, ``, `📈 <b>Trending</b> | ${buildGeneratedStamp()}`, ``, `These are Gorktimus-ranked live candidates, not a raw Dex mirror.`, `Tap the token button to get the address, then scan, watch, or open Dex.`].join("\n"),
+    buildMainMenuOnlyButton()
+  );
+
+  for (let i = 0; i < pairs.length; i++) {
+    await sendText(chatId, buildTrendingCompactLine(pairs[i], i + 1), buildTrendingActionMenu(pairs[i], i === pairs.length - 1));
+    if (i < pairs.length - 1) await sleep(150);
+  }
+}
+
+async function buildLaunchCandidates(limit = 5) {
+  const profiles = await fetchLatestProfiles();
+  const boosts = await fetchLatestBoosts();
+  const merged = new Map();
+
+  for (const item of profiles) {
+    if (!item?.chainId || !item?.tokenAddress) continue;
+    if (!supportsChain(item.chainId)) continue;
+    merged.set(`${item.chainId}:${item.tokenAddress}`, { chainId: String(item.chainId), tokenAddress: String(item.tokenAddress) });
+  }
+
+  for (const item of boosts) {
+    if (!item?.chainId || !item?.tokenAddress) continue;
+    if (!supportsChain(item.chainId)) continue;
+    const key = `${item.chainId}:${item.tokenAddress}`;
+    if (!merged.has(key)) merged.set(key, { chainId: String(item.chainId), tokenAddress: String(item.tokenAddress) });
+  }
+
+  const out = [];
+  for (const item of [...merged.values()].slice(0, 50)) {
+    const pair = await resolveTokenToBestPair(item.chainId, item.tokenAddress);
+    if (!pair) continue;
+    const ageMin = ageMinutesFromMs(pair.pairCreatedAt);
+    if (pair.liquidityUsd < LAUNCH_MIN_LIQ_USD) continue;
+    if (pair.volumeH24 < LAUNCH_MIN_VOL_USD) continue;
+    if (ageMin > 1440) continue;
+    if (pair.buysM5 + pair.sellsM5 < 2) continue;
+    out.push(pair);
+  }
+
+  return out.sort((a, b) => pTrendScore(b) - pTrendScore(a)).slice(0, limit);
+}
+
+async function showLaunchRadar(chatId) {
+  const launches = await buildLaunchCandidates(5);
+
+  if (!launches.length) {
+    await sendText(chatId, `🧠 <b>Gorktimus Intelligence Terminal</b>\n\n📡 <b>Launch Radar</b>\n\nNo strong launch candidates were found right now.`, buildRefreshMainButtons("launch_radar"));
+    return;
+  }
+
+  for (let i = 0; i < launches.length; i++) {
+    const pair = launches[i];
+    const imageUrl = await fetchTokenProfileImage(pair.chainId, pair.baseAddress, pair);
+    await sendCard(chatId, await buildLaunchCard(pair, i + 1, chatId), i === launches.length - 1 ? buildRefreshMainButtons("launch_radar") : {}, imageUrl);
+    if (i < launches.length - 1) await sleep(250);
+  }
+}
+
+async function showModeLab(chatId) {
+  const settings = await getUserSettings(chatId);
+  const lines = [
+    `🧠 <b>Gorktimus Intelligence Terminal</b>`,
+    ``,
+    `🧬 <b>Mode Lab</b>`,
+    ``,
+    `Current mode: <b>${escapeHtml(modeTitle(settings.mode))}</b>`,
+    ``,
+    `Aggressive = faster entries, more risk tolerance.`,
+    `Balanced = strongest overall default.`,
+    `Guardian = stricter defense and cleaner filters.`
+  ].join("\n");
+  await sendText(chatId, lines, buildModeMenu(settings.mode));
+}
+
+async function showAlertCenter(chatId) {
+  const settings = await getUserSettings(chatId);
+  const lines = [
+    `🧠 <b>Gorktimus Intelligence Terminal</b>`,
+    ``,
+    `🚨 <b>Alert Center</b>`,
+    ``,
+    `Master alerts: <b>${num(settings.alerts_enabled) ? "ON" : "OFF"}</b>`,
+    `Launch alerts: <b>${num(settings.launch_alerts) ? "ON" : "OFF"}</b>`,
+    `Smart alerts: <b>${num(settings.smart_alerts) ? "ON" : "OFF"}</b>`,
+    `Risk alerts: <b>${num(settings.risk_alerts) ? "ON" : "OFF"}</b>`,
+    `Whale alerts: <b>${num(settings.whale_alerts) ? "ON" : "OFF"}</b>`
+  ].join("\n");
+  await sendText(chatId, lines, buildAlertCenterMenu(settings));
+}
+
+async function showWatchlist(chatId) {
+  const rows = await getWatchlistItems(chatId);
+  if (!rows.length) {
+    await sendText(chatId, `🧠 <b>Gorktimus Intelligence Terminal</b>\n\n👁 <b>Watchlist</b>\n\nNo tokens saved yet. Scan a token and tap <b>Add Watchlist</b>.`, buildMainMenuOnlyButton());
+    return;
+  }
+
+  const lines = [`🧠 <b>Gorktimus Intelligence Terminal</b>`, ``, `👁 <b>Watchlist</b>`, ``, `Saved tokens: <b>${rows.length}</b>`, `Tap any token below to open it.`].join("\n");
+  await sendText(chatId, lines, buildWatchlistMenu(rows));
+}
+
+async function showWatchlistItem(chatId, chainId, tokenAddress) {
+  const pair = await resolveExactPairOrToken(chainId, tokenAddress);
+  if (!pair) {
+    await sendText(chatId, `🧠 <b>Gorktimus Intelligence Terminal</b>\n\n👁 <b>Watchlist</b>\n\nThat token could not be refreshed right now.`, buildMainMenuOnlyButton());
+    return;
+  }
+
+  const imageUrl = await fetchTokenProfileImage(pair.chainId, pair.baseAddress, pair);
+  const verdict = await buildRiskVerdict(pair, chatId);
+  await savePairMemorySnapshot(pair, verdict.score);
+  await sendCard(chatId, await buildScanCard(pair, "👁 Watchlist Token", chatId), buildWatchlistItemMenu(pair), imageUrl);
+}
+
+async function showEdgeBrain(chatId) {
+  const settings = await getUserSettings(chatId);
+  const rows = await getWatchlistItems(chatId);
+  const latestFeedback = await get(`SELECT COUNT(*) AS c FROM scan_feedback WHERE user_id = ? AND created_at >= ?`, [String(chatId), nowTs() - 86400 * 7]);
+
+  const lines = [
+    `🧠 <b>Gorktimus Intelligence Terminal</b>`,
+    ``,
+    `🧠 <b>Edge Brain</b>`,
+    ``,
+    `Mode: <b>${escapeHtml(modeTitle(settings.mode))}</b>`,
+    `Adaptive memory: <b>ON</b>`,
+    `7D user feedback events: <b>${latestFeedback?.c || 0}</b>`,
+    `Saved watchlist tokens: <b>${rows.length}</b>`,
+    ``,
+    `This stack learns from repeated rescans, market drift, and your good / bad call feedback.`
+  ].join("\n");
+
+  await sendText(chatId, lines, buildMainMenuOnlyButton());
+}
+
+async function showInviteFriends(chatId) {
+  const botLink = buildBotDeepLink();
+  const lines = [
+    `🧠 <b>Gorktimus Intelligence Terminal</b>`,
+    ``,
+    `🚀 <b>Invite Friends</b>`,
+    ``,
+    botLink ? `Share this bot link:\n${escapeHtml(botLink)}` : `Bot username not detected yet.`
+  ].join("\n");
+  await sendText(chatId, lines, buildMainMenuOnlyButton());
+}
+
+async function promptScanToken(chatId) {
+  pendingAction.set(chatId, { type: "SCAN_TOKEN" });
+  await sendText(chatId, `🧠 <b>Gorktimus Intelligence Terminal</b>\n\n🔎 Send a token ticker, token address, or pair search.`, buildMainMenuOnlyButton());
+}
+
 
 // ================= HELP SCREENS =================
 async function showSystemStatus(chatId) {
@@ -1912,19 +2737,27 @@ async function showHowToUse(chatId) {
     `📖 <b>How To Use</b>`,
     ``,
     `🔎 <b>Scan Token</b>`,
-    `Analyze a token by ticker, token address, or pair search.`,
+    `Send a ticker, token address, or pair search. Gorktimus will resolve the strongest pair it can find, score risk, and explain what the market structure looks like.`,
     ``,
     `📈 <b>Trending</b>`,
-    `View stronger live candidates built from recent profiles, boosts, liquidity, volume, and flow.`,
+    `This is not meant to copy Dex line-for-line. Trending is rebuilt from live candidate discovery and then filtered by liquidity, flow, and structural quality. Tap the token name to get the address, then use the quick buttons to scan, watch, or open Dex.`,
     ``,
     `📡 <b>Launch Radar</b>`,
-    `Review newer launches with a short market verdict.`,
+    `Shows fresher launches that still meet minimum live market conditions. This is for early discovery, not guaranteed safety.`,
     ``,
     `⭐ <b>Prime Picks</b>`,
-    `View cleaner candidates that pass liquidity, volume, age, and risk filters.`,
+    `Shows stronger candidates that cleared tighter liquidity, volume, age, and risk filters.`,
     ``,
-    `🐋 <b>Whale Tracker</b>`,
-    `Track named whale and dev wallets with optional alerts.`
+    `👁 <b>Watchlist</b>`,
+    `Save tokens, re-scan them quickly, and let the bot monitor for meaningful drift.`,
+    ``,
+    `🤖 <b>AI Assistant</b>`,
+    `Turn on assistant mode if you want to ask natural questions about scans, safety score, holder concentration, why a token differs from Dex, or what a live setup may be signaling.`,
+    ``,
+    `🧬 <b>Mode Lab</b>`,
+    `Aggressive = earlier entries and more tolerance for risk.
+Balanced = strongest default.
+Guardian = stricter defense and cleaner filtering.`
   ].join("\n");
 
   await sendText(chatId, text, buildMainMenuOnlyButton());
@@ -1936,15 +2769,21 @@ async function showDataSources(chatId) {
     ``,
     `⚙️ <b>Data Sources</b>`,
     ``,
-    `Market data uses:`,
+    `Primary market discovery uses:`,
     `• DexScreener`,
-    `• Birdeye`,
-    `• GeckoTerminal`,
+    `• Birdeye links`,
+    `• GeckoTerminal links`,
+    ``,
+    `Additional risk and contract layers use:`,
     `• Honeypot.is`,
     `• Etherscan V2`,
+    `• Helius RPC for Solana holder concentration`,
     ``,
-    `Wallet monitoring uses:`,
-    `• Helius RPC`,
+    `How to think about this:`,
+    `Dex is usually the discovery layer.`,
+    `Gorktimus is the intelligence layer.`,
+    ``,
+    `That means price, liquidity, and flow may begin from the live pair feed, but the terminal then adds contract, holder, behavior, memory, and mode-aware interpretation on top. That is why the output is designed to be smarter than a raw trending feed, not identical to one.`,
     ``,
     `Supported priority chains:`,
     `• Solana`,
@@ -1966,6 +2805,288 @@ async function showCommunity(chatId) {
   ].join("\n");
 
   await sendText(chatId, text, buildMainMenuOnlyButton());
+}
+
+async function showHowGorktimusWorks(chatId) {
+  const text = [
+    `🧠 <b>How Gorktimus Works</b>`,
+    ``,
+    `Gorktimus is built as a live crypto intelligence terminal, not a simple market mirror.`,
+    ``,
+    `The stack does three different jobs:`,
+    `• discovers active pairs`,
+    `• scores structural risk and opportunity`,
+    `• explains the result in plain language`,
+    ``,
+    `That means it is trying to answer a harder question than “what is moving?”`,
+    `It is trying to answer “what is moving, how clean is it, and what could be hiding underneath that movement?”`,
+    ``,
+    `So when you scan a token, you are not just getting price and liquidity. You are also getting holder concentration context, contract transparency clues, behavior signals, memory bias from prior outcomes, and mode-aware score shaping.`
+  ].join("\n");
+
+  await sendText(chatId, text, buildMainMenuOnlyButton());
+}
+
+async function showWhyDifferentFromDex(chatId) {
+  const text = [
+    `🧠 <b>Why Gorktimus Does Not Always Match Dex</b>`,
+    ``,
+    `Dex is a raw activity feed.`,
+    `Gorktimus is a filtered intelligence layer.`,
+    ``,
+    `Dex can surface tokens because they are simply loud:`,
+    `• volume spikes`,
+    `• transaction bursts`,
+    `• paid boosts`,
+    `• very early launches`,
+    ``,
+    `Gorktimus can deliberately rank those lower if the structure looks weak:`,
+    `• thin liquidity`,
+    `• suspicious holder concentration`,
+    `• dangerous tax / honeypot signals`,
+    `• poor contract transparency`,
+    `• one-sided or spammy transaction patterns`,
+    ``,
+    `So if a token is high on Dex but lower here, that usually means the terminal thinks the raw noise is stronger than the underlying structure.`
+  ].join("\n");
+
+  await sendText(chatId, text, buildMainMenuOnlyButton());
+}
+
+async function showTransactionsExplained(chatId) {
+  const text = [
+    `🧠 <b>Transactions / Flow Explained</b>`,
+    ``,
+    `When Gorktimus shows buys, sells, and transactions, it is reading recent live pair activity from the market feed and then interpreting it.`,
+    ``,
+    `Important: transaction count does <b>not</b> automatically mean real strength.`,
+    ``,
+    `High transactions can still be weak if:`,
+    `• average size is tiny`,
+    `• liquidity is thin`,
+    `• the buy pressure is too one-sided`,
+    `• the move looks manufactured`,
+    ``,
+    `That is why Gorktimus treats transactions as one part of the puzzle, not the whole puzzle. Flow is read together with liquidity, volume, holder concentration, taxes, contract transparency, and memory bias.`
+  ].join("\n");
+
+  await sendText(chatId, text, buildMainMenuOnlyButton());
+}
+
+async function showScoreExplained(chatId) {
+  const text = [
+    `🧠 <b>Safety Score + Confidence</b>`,
+    ``,
+    `The safety score is a live structured judgment, not a guarantee and not financial advice.`,
+    ``,
+    `The score weighs things like:`,
+    `• liquidity health`,
+    `• age / launch maturity`,
+    `• recent buy-vs-sell flow`,
+    `• volume quality`,
+    `• holder concentration`,
+    `• honeypot / tax clues`,
+    `• contract transparency`,
+    `• adaptive memory`,
+    `• current mode`,
+    ``,
+    `Confidence tells you how complete the supporting evidence is.`,
+    `Higher confidence usually means more source checks lined up cleanly. Lower confidence usually means the terminal had to work with partial or noisy data.`
+  ].join("\n");
+
+  await sendText(chatId, text, buildMainMenuOnlyButton());
+}
+
+
+async function showAIAssistantIntro(chatId) {
+  pendingAction.set(chatId, { type: "AI_ASSISTANT" });
+
+  const text = [
+    `🧠 <b>Gorktimus AI Assistant</b>`,
+    ``,
+    `Assistant mode is now <b>ON</b>.`,
+    ``,
+    `Ask natural questions like:`,
+    `• why did this token score low`,
+    `• what does holder concentration mean`,
+    `• why does trending not match Dex`,
+    `• explain transactions and flow`,
+    `• which mode should I use`,
+    `• scan BONK`,
+    `• scan 0x...`,
+    ``,
+    `Type <b>exit</b> or tap <b>Exit Assistant</b> when you want to leave assistant mode.`
+  ].join("\n");
+
+  await sendText(chatId, text, buildAIAssistantMenu());
+}
+
+function buildAssistantGenericReply() {
+  return [
+    `🧠 <b>Gorktimus AI Assistant</b>`,
+    ``,
+    `I can explain how the terminal works, why a score is high or low, what transactions or holder concentration mean, why results can differ from Dex, or I can scan a ticker / address for you right now.`,
+    ``,
+    `Try something like:`,
+    `• why did this score low`,
+    `• explain safety score`,
+    `• why not match Dex`,
+    `• what do transactions mean`,
+    `• aggressive vs guardian`,
+    `• BONK`,
+    `• 0x...`
+  ].join("\n");
+}
+
+async function sendAssistantPairReply(chatId, pair) {
+  const verdict = await buildRiskVerdict(pair, chatId);
+  const lines = [
+    `🧠 <b>Gorktimus AI Assistant</b>`,
+    ``,
+    `<b>${escapeHtml(pair.baseSymbol || "Unknown")}</b> on <b>${escapeHtml(humanChain(pair.chainId))}</b>`,
+    ``,
+    `Here is the plain-English read:`,
+    `• Safety score: <b>${escapeHtml(String(verdict.score))}/100</b>`,
+    `• Confidence: <b>${escapeHtml(verdict.confidence)}</b>`,
+    `• Liquidity health: <b>${escapeHtml(verdict.liquidity)}</b>`,
+    `• Holder structure: <b>${escapeHtml(verdict.holders)}</b>`,
+    `• Contract / transparency: <b>${escapeHtml(verdict.transparency)}</b>`,
+    `• Flow read: <b>${escapeHtml(verdict.flowBehavior)}</b>`,
+    `• Tx spam signal: <b>${escapeHtml(verdict.spamSignal)}</b>`,
+    `• Coordination signal: <b>${escapeHtml(verdict.coordinationSignal)}</b>`,
+    ``,
+    `Recommendation: ${escapeHtml(verdict.recommendation)}`,
+    ``,
+    `If you want the full card, tap <b>Scan Token</b> or just send another ticker/address while assistant mode is active.`
+  ].join("\n");
+
+  await sendText(chatId, lines, buildAIAssistantMenu());
+}
+
+async function handleAIAssistantQuery(chatId, text) {
+  const cleaned = String(text || "").trim();
+  const lower = cleaned.toLowerCase();
+
+  if (!cleaned) return;
+
+  if (/^(exit|quit|close|done|menu|main menu)$/i.test(cleaned)) {
+    pendingAction.delete(chatId);
+    await showMainMenu(chatId);
+    return;
+  }
+
+  if (/^scan\s+(.+)/i.test(cleaned)) {
+    const q = cleaned.replace(/^scan\s+/i, "").trim();
+    const pair = await resolveBestPair(q);
+    if (!pair) {
+      await sendText(chatId, `🧠 <b>Gorktimus AI Assistant</b>\n\nI could not resolve a strong live token match for <b>${escapeHtml(q)}</b>. Try a ticker, token address, or pair address.`, buildAIAssistantMenu());
+      return;
+    }
+    const imageUrl = await fetchTokenProfileImage(pair.chainId, pair.baseAddress, pair);
+    await sendCard(chatId, await buildScanCard(pair, "🤖 AI Assistant Scan", chatId), buildScanActionButtons(pair), imageUrl);
+    await sendAssistantPairReply(chatId, pair);
+    return;
+  }
+
+  if (
+    isAddressLike(cleaned) ||
+    (/^[A-Za-z0-9_.$-]{2,24}$/.test(cleaned) &&
+      !cleaned.startsWith("/") &&
+      !/(what|why|how|when|where|should|does|is|are|can|explain|tell|compare|entry|liquidity|volume|risk|reward|slippage|scalp|swing|hold)/i.test(cleaned))
+  ) {
+    const pair = await resolveBestPair(cleaned);
+    if (!pair) {
+      await sendText(chatId, `🧠 <b>Gorktimus AI Assistant</b>\n\nI could not resolve a strong live token match for <b>${escapeHtml(cleaned)}</b>. Try a ticker, token address, or pair address.`, buildAIAssistantMenu());
+      return;
+    }
+
+    const imageUrl = await fetchTokenProfileImage(pair.chainId, pair.baseAddress, pair);
+    await sendCard(chatId, await buildScanCard(pair, "🤖 AI Assistant Scan", chatId), buildScanActionButtons(pair), imageUrl);
+    await sendAssistantPairReply(chatId, pair);
+    return;
+  }
+
+  if (/compare\s+(.+?)\s+(?:vs|and)\s+(.+)/i.test(cleaned)) {
+    const m = cleaned.match(/compare\s+(.+?)\s+(?:vs|and)\s+(.+)/i);
+    const leftQ = m?.[1]?.trim() || "";
+    const rightQ = m?.[2]?.trim() || "";
+    const [left, right] = await Promise.all([resolveBestPair(leftQ), resolveBestPair(rightQ)]);
+    if (!left || !right) {
+      await sendText(chatId, `🧠 <b>Gorktimus AI Assistant</b>\n\nI could not resolve both sides of that comparison. Try: <b>compare BONK vs WIF</b>`, buildAIAssistantMenu());
+      return;
+    }
+    const [lv, rv] = await Promise.all([buildRiskVerdict(left, chatId), buildRiskVerdict(right, chatId)]);
+    const winner = lv.score === rv.score ? "Tie / context dependent" : lv.score > rv.score ? safeSymbolText(left.baseSymbol) : safeSymbolText(right.baseSymbol);
+    const lines = [
+      `🧠 <b>Gorktimus AI Assistant</b>`,
+      ``,
+      `<b>Comparison</b>`,
+      `• ${escapeHtml(safeSymbolText(left.baseSymbol))}: score <b>${lv.score}</b>, confidence <b>${escapeHtml(lv.confidence)}</b>, liquidity <b>${escapeHtml(lv.liquidity)}</b>`,
+      `• ${escapeHtml(safeSymbolText(right.baseSymbol))}: score <b>${rv.score}</b>, confidence <b>${escapeHtml(rv.confidence)}</b>, liquidity <b>${escapeHtml(rv.liquidity)}</b>`,
+      ``,
+      `Current cleaner setup: <b>${escapeHtml(winner)}</b>`,
+      `This is a structure read from the live data stack, not a guaranteed outcome.`
+    ].join("\n");
+    await sendText(chatId, lines, buildAIAssistantMenu());
+    return;
+  }
+
+  const tradingReply = tradingConceptReply(lower);
+  if (tradingReply) {
+    await sendText(chatId, tradingReply, buildAIAssistantMenu());
+    return;
+  }
+
+  if (/(how.*work|what is gorktimus|what does gorktimus do|how does this work|what is this system)/i.test(lower)) {
+    await showHowGorktimusWorks(chatId);
+    return;
+  }
+
+  if (/(dex|match dex|different from dex|why.*dex|raw feed|trending source)/i.test(lower)) {
+    await showWhyDifferentFromDex(chatId);
+    return;
+  }
+
+  if (/(transaction|tx|buys|sells|flow|volume|spam)/i.test(lower)) {
+    await showTransactionsExplained(chatId);
+    return;
+  }
+
+  if (/(score|confidence|integrity|safe|safety|holder concentration|honeypot|tax|transparency)/i.test(lower)) {
+    await showScoreExplained(chatId);
+    return;
+  }
+
+  if (/(mode|aggressive|balanced|guardian)/i.test(lower)) {
+    await sendText(
+      chatId,
+      [
+        `🧠 <b>Gorktimus AI Assistant</b>`,
+        ``,
+        `Mode guide:`,
+        `• <b>Aggressive</b> = earlier entries, more tolerance for fresh or hotter setups`,
+        `• <b>Balanced</b> = strongest default for most users`,
+        `• <b>Guardian</b> = stricter defense, better if you want cleaner structure and less tolerance for weak liquidity or concentration risk`
+      ].join("\n"),
+      buildAIAssistantMenu()
+    );
+    return;
+  }
+
+  if (/(what should i buy|best trade|what should i trade|good trade|should i ape)/i.test(lower)) {
+    await sendText(
+      chatId,
+      [
+        `🧠 <b>Gorktimus AI Assistant</b>`,
+        ``,
+        `I do not pick blind trades out of thin air. Send me a ticker, address, or use <b>compare A vs B</b> and I will break down the live structure, risk, confidence, and what the setup appears to be doing.`
+      ].join("\n"),
+      buildAIAssistantMenu()
+    );
+    return;
+  }
+
+  await sendText(chatId, buildAssistantGenericReply(), buildAIAssistantMenu());
 }
 
 // ================= WHALE / DEV TRACKING =================
@@ -2458,6 +3579,11 @@ async function handlePendingAction(chatId, text) {
       await renameWallet(chatId, pending.id, input);
       return true;
     }
+
+    if (pending.type === "AI_ASSISTANT") {
+      await handleAIAssistantQuery(chatId, input);
+      return true;
+    }
   } catch (err) {
     pendingAction.delete(chatId);
     console.log("handlePendingAction error:", err.message);
@@ -2470,6 +3596,72 @@ async function handlePendingAction(chatId, text) {
   }
 
   return false;
+}
+
+async function scanWatchlistAlerts() {
+  const rows = await all(`SELECT * FROM watchlist WHERE active = 1 AND alerts_enabled = 1`, []);
+  if (!rows.length) return;
+
+  for (const row of rows) {
+    try {
+      const settings = await getUserSettings(row.chat_id);
+      if (!num(settings.alerts_enabled)) continue;
+
+      const pair = await resolveExactPairOrToken(row.chain_id, row.token_address);
+      if (!pair) continue;
+
+      const verdict = await buildRiskVerdict(pair, row.chat_id);
+      await savePairMemorySnapshot(pair, verdict.score);
+
+      const oldPrice = num(row.last_price);
+      const oldLiq = num(row.last_liquidity);
+      const oldScore = num(row.last_score);
+      const newPrice = num(pair.priceUsd);
+      const newLiq = num(pair.liquidityUsd);
+      const priceDelta = oldPrice > 0 ? ((newPrice - oldPrice) / oldPrice) * 100 : 0;
+      const liqDelta = oldLiq > 0 ? ((newLiq - oldLiq) / oldLiq) * 100 : 0;
+      const scoreDelta = verdict.score - oldScore;
+      const since = nowTs() - num(row.last_alert_ts);
+
+      let shouldAlert = false;
+      let reason = "";
+
+      if (num(settings.smart_alerts) && priceDelta >= 12 && verdict.score >= 60) {
+        shouldAlert = true;
+        reason = `Momentum burst: ${toPct(priceDelta)}`;
+      } else if (num(settings.launch_alerts) && ageMinutesFromMs(pair.pairCreatedAt) <= 45 && verdict.score >= 58) {
+        shouldAlert = since >= WATCHLIST_ALERT_COOLDOWN_SEC;
+        reason = `Fresh launch watchlist token is active`;
+      } else if (num(settings.risk_alerts) && (scoreDelta <= -12 || liqDelta <= -18 || verdict.score <= 40)) {
+        shouldAlert = true;
+        reason = `Risk deterioration detected`;
+      }
+
+      if (shouldAlert && since >= WATCHLIST_ALERT_COOLDOWN_SEC) {
+        const text = [
+          `🧠 <b>Gorktimus Watchlist Alert</b>`,
+          ``,
+          `🪙 <b>${escapeHtml(pair.baseSymbol || pair.baseName || 'Unknown')}</b>`,
+          `⛓️ ${escapeHtml(humanChain(pair.chainId))}`,
+          `📢 ${escapeHtml(reason)}`,
+          `📊 Score: <b>${verdict.score}/100</b>`,
+          `💲 Price: ${escapeHtml(shortUsd(pair.priceUsd))}`,
+          `💧 Liquidity: ${escapeHtml(shortUsd(pair.liquidityUsd))}`,
+          `📈 Volume 24h: ${escapeHtml(shortUsd(pair.volumeH24))}`
+        ].join("\n");
+
+        await sendText(row.chat_id, text, buildWatchlistItemMenu(pair));
+        await run(`UPDATE watchlist SET last_alert_ts = ?, updated_at = ? WHERE id = ?`, [nowTs(), nowTs(), row.id]);
+      }
+
+      await run(
+        `UPDATE watchlist SET pair_address = ?, symbol = ?, last_price = ?, last_liquidity = ?, last_volume = ?, last_score = ?, updated_at = ? WHERE id = ?`,
+        [String(pair.pairAddress || ''), String(pair.baseSymbol || ''), newPrice, newLiq, num(pair.volumeH24), verdict.score, nowTs(), row.id]
+      );
+    } catch (err) {
+      console.log("scanWatchlistAlerts item error:", err.message);
+    }
+  }
 }
 
 // ================= HANDLERS =================
@@ -2525,6 +3717,30 @@ async function registerHandlers() {
     }
   });
 
+  bot.onText(/\/watchlist/, async (msg) => {
+    try {
+      if (!isPrivateChat(msg)) return;
+      await upsertUserFromMessage(msg, 0);
+      const ok = await ensureSubscribedOrBlock(msg);
+      if (!ok) return;
+      await showWatchlist(msg.chat.id);
+    } catch (err) {
+      console.log("/watchlist error:", err.message);
+    }
+  });
+
+  bot.onText(/\/mode/, async (msg) => {
+    try {
+      if (!isPrivateChat(msg)) return;
+      await upsertUserFromMessage(msg, 0);
+      const ok = await ensureSubscribedOrBlock(msg);
+      if (!ok) return;
+      await showModeLab(msg.chat.id);
+    } catch (err) {
+      console.log("/mode error:", err.message);
+    }
+  });
+
   bot.on("callback_query", async (query) => {
     const chatId = query.message?.chat?.id;
     const data = query.data || "";
@@ -2550,6 +3766,7 @@ async function registerHandlers() {
       if (!ok) return;
 
       if (data === "main_menu") {
+        pendingAction.delete(chatId);
         await showMainMenu(chatId);
       } else if (data === "scan_token") {
         await promptScanToken(chatId);
@@ -2559,6 +3776,16 @@ async function registerHandlers() {
         await showLaunchRadar(chatId);
       } else if (data === "prime_picks") {
         await showPrimePicks(chatId);
+      } else if (data === "watchlist") {
+        await showWatchlist(chatId);
+      } else if (data === "mode_lab") {
+        await showModeLab(chatId);
+      } else if (data === "alert_center") {
+        await showAlertCenter(chatId);
+      } else if (data === "edge_brain") {
+        await showEdgeBrain(chatId);
+      } else if (data === "ai_assistant") {
+        await showAIAssistantIntro(chatId);
       } else if (data === "whale_menu") {
         await showWhaleMenu(chatId);
       } else if (data === "help_menu") {
@@ -2567,12 +3794,86 @@ async function registerHandlers() {
         await showSystemStatus(chatId);
       } else if (data === "help_how") {
         await showHowToUse(chatId);
+      } else if (data === "help_engine") {
+        await showHowGorktimusWorks(chatId);
+      } else if (data === "help_dex_diff") {
+        await showWhyDifferentFromDex(chatId);
+      } else if (data === "help_transactions") {
+        await showTransactionsExplained(chatId);
+      } else if (data === "help_score") {
+        await showScoreExplained(chatId);
       } else if (data === "help_sources") {
         await showDataSources(chatId);
       } else if (data === "help_community") {
         await showCommunity(chatId);
       } else if (data === "invite_friends") {
         await showInviteFriends(chatId);
+      } else if (data.startsWith("set_mode:")) {
+        const mode = safeMode(data.split(":")[1]);
+        await setUserSetting(chatId, "mode", mode);
+        await answerCallbackSafe(query.id, `Mode set to ${modeTitle(mode)}`);
+        await showModeLab(chatId);
+      } else if (data.startsWith("toggle_setting:")) {
+        const field = String(data.split(":")[1] || "");
+        const settings = await getUserSettings(chatId);
+        const current = num(settings[field]);
+        await setUserSetting(chatId, field, current ? 0 : 1);
+        await showAlertCenter(chatId);
+      } else if (data.startsWith("trend_copy:")) {
+        const parts = data.split(":");
+        const chainId = expandCompactChainId(parts[1]);
+        const tokenAddress = parts[2];
+        const pair = await resolveExactPairOrToken(chainId, tokenAddress);
+        const address = pair?.baseAddress || tokenAddress;
+        await sendText(
+          chatId,
+          `📋 <b>${escapeHtml(pair?.baseSymbol || "Token")} Address</b>\n\n<code>${escapeHtml(address)}</code>`,
+          buildMainMenuOnlyButton()
+        );
+      } else if (data.startsWith("trend_scan:")) {
+        const parts = data.split(":");
+        const chainId = expandCompactChainId(parts[1]);
+        const tokenAddress = parts[2];
+        const pair = await resolveExactPairOrToken(chainId, tokenAddress);
+        if (pair) {
+          const imageUrl = await fetchTokenProfileImage(pair.chainId, pair.baseAddress, pair);
+          await sendCard(chatId, await buildScanCard(pair, "📈 Trending Scan", chatId), buildScanActionButtons(pair), imageUrl);
+        }
+      } else if (data.startsWith("watch_add:")) {
+        const parts = data.split(":");
+        const chainId = expandCompactChainId(parts[1]);
+        const tokenAddress = parts[2];
+        const pair = await resolveExactPairOrToken(chainId, tokenAddress);
+        if (pair) {
+          await addWatchlistItem(chatId, pair);
+          await answerCallbackSafe(query.id, "Added to watchlist.");
+        }
+      } else if (data.startsWith("watch_open:")) {
+        const parts = data.split(":");
+        await showWatchlistItem(chatId, expandCompactChainId(parts[1]), parts[2]);
+      } else if (data.startsWith("watch_rescan:")) {
+        const parts = data.split(":");
+        const pair = await resolveExactPairOrToken(expandCompactChainId(parts[1]), parts[2]);
+        if (pair) {
+          const imageUrl = await fetchTokenProfileImage(pair.chainId, pair.baseAddress, pair);
+          await sendCard(chatId, await buildScanCard(pair, "🔁 Watchlist Re-Scan", chatId), buildWatchlistItemMenu(pair), imageUrl);
+          const verdict = await buildRiskVerdict(pair, chatId);
+          await savePairMemorySnapshot(pair, verdict.score);
+        }
+      } else if (data.startsWith("watch_remove:")) {
+        const parts = data.split(":");
+        await removeWatchlistItem(chatId, expandCompactChainId(parts[1]), parts[2]);
+        await answerCallbackSafe(query.id, "Removed from watchlist.");
+        await showWatchlist(chatId);
+      } else if (data.startsWith("feedback:")) {
+        const parts = data.split(":");
+        const feedback = parts[1] === 'g' ? 'good' : 'bad';
+        const pair = await resolveExactPairOrToken(expandCompactChainId(parts[2]), parts[3]);
+        if (pair) {
+          const verdict = await buildRiskVerdict(pair, chatId);
+          await addScanFeedback(chatId, pair, feedback, verdict.score);
+          await answerCallbackSafe(query.id, feedback === "good" ? "Logged as good call." : "Logged as bad call.");
+        }
       } else if (data === "add_whale") {
         pendingAction.set(chatId, { type: "ADD_WHALE_WALLET" });
         await sendText(
@@ -2654,9 +3955,16 @@ async function registerHandlers() {
       const handled = await handlePendingAction(chatId, text);
       if (handled) return;
 
-      if (isAddressLike(text.trim())) {
+      const cleaned = text.trim();
+      if (isAddressLike(cleaned)) {
         await trackScan(chatId);
-        await runTokenScan(chatId, text.trim());
+        await runTokenScan(chatId, cleaned);
+        return;
+      }
+
+      if (/^[A-Za-z0-9_.$-]{2,24}$/.test(cleaned) && !cleaned.startsWith("/")) {
+        await trackScan(chatId);
+        await runTokenScan(chatId, cleaned);
       }
     } catch (err) {
       console.log("message handler error:", err.message);
@@ -2672,71 +3980,6 @@ async function registerHandlers() {
   });
 }
 
-
-
-// ================= RUNTIME SAFETY FALLBACKS =================
-async function trackUserActivity(userId) {
-  await run(
-    `INSERT INTO user_activity (user_id, ts) VALUES (?, ?)`,
-    [String(userId), nowTs()]
-  );
-}
-
-async function trackScan(userId) {
-  await run(
-    `INSERT INTO scan_logs (user_id, ts) VALUES (?, ?)`,
-    [String(userId), nowTs()]
-  );
-}
-
-async function getNetworkPulse() {
-  const now = nowTs();
-  const startOfDay = now - 86400;
-  const liveWindow = now - 900;
-
-  const todayUsers = await get(
-    `SELECT COUNT(DISTINCT user_id) as c FROM user_activity WHERE ts >= ?`,
-    [startOfDay]
-  );
-
-  const liveUsers = await get(
-    `SELECT COUNT(DISTINCT user_id) as c FROM user_activity WHERE ts >= ?`,
-    [liveWindow]
-  );
-
-  const scansToday = await get(
-    `SELECT COUNT(*) as c FROM scan_logs WHERE ts >= ?`,
-    [startOfDay]
-  );
-
-  return `⚡ ${todayUsers?.c || 0} today • ${liveUsers?.c || 0} live • ${scansToday?.c || 0} scans`;
-}
-
-async function showMainMenu(chatId) {
-  const pulse = await getNetworkPulse();
-  await sendMenu(
-    chatId,
-    `🧠 <b>Gorktimus Intelligence Terminal</b>\n\n${pulse}\n\nLive intelligence. On-demand execution.\nNo clutter. No spam.\n\nSelect an operation below.`,
-    buildMainMenu()
-  );
-}
-
-async function showHelpMenu(chatId) {
-  await sendMenu(
-    chatId,
-    `🧠 <b>Gorktimus Intelligence Terminal</b>\n\n❓ <b>Help Center</b>\nEverything below pulls live data when requested.`,
-    buildHelpMenu()
-  );
-}
-
-async function showWhaleMenu(chatId) {
-  await sendMenu(
-    chatId,
-    `🧠 <b>Gorktimus Intelligence Terminal</b>\n\n🐋 <b>Whale Tracker</b>\nTrack named wallets and monitor movement on demand or by wallet alerts.`,
-    buildWhaleMenu()
-  );
-}
-
 // ================= CLEAN SHUTDOWN =================
 async function shutdown(signal) {
   if (shuttingDown) return;
@@ -2746,6 +3989,7 @@ async function shutdown(signal) {
 
   try {
     if (walletScanInterval) clearInterval(walletScanInterval);
+    if (watchlistScanInterval) clearInterval(watchlistScanInterval);
 
     if (bot) {
       try {
@@ -2811,5 +4055,11 @@ process.once("SIGINT", () => shutdown("SIGINT"));
     walletScanInterval = setInterval(() => {
       scanWalletTracks();
     }, WALLET_SCAN_INTERVAL_MS);
+  }
+
+  if (!watchlistScanInterval) {
+    watchlistScanInterval = setInterval(() => {
+      scanWatchlistAlerts().catch((err) => console.log("scanWatchlistAlerts loop error:", err.message));
+    }, WATCHLIST_SCAN_INTERVAL_MS);
   }
 })();
