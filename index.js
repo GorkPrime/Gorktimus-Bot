@@ -2474,6 +2474,7 @@ function buildTrendingActionMenu(pair, isLast = false) {
 async function buildTrendingCandidates(limit = 10) {
   const profiles = await fetchLatestProfiles();
   const boosts = await fetchLatestBoosts();
+  
   const merged = new Map();
 
   for (const item of profiles) {
@@ -2483,7 +2484,39 @@ async function buildTrendingCandidates(limit = 10) {
       chainId: String(item.chainId),
       tokenAddress: String(item.tokenAddress)
     });
+  }async function buildTrendingList() {
+  const profiles = await fetchLatestProfiles();
+  const boosts = await fetchLatestBoosts();
+
+  const merged = new Map();
+
+  for (const p of profiles) {
+    if (!p?.tokenAddress) continue;
+    merged.set(p.tokenAddress, p);
   }
+
+  for (const b of boosts) {
+    if (!b?.tokenAddress) continue;
+    merged.set(b.tokenAddress, b);
+  }
+
+  const results = [];
+
+  for (const item of merged.values()) {
+    try {
+      const pair = await resolveTokenToBestPair(item.chainId, item.tokenAddress);
+      if (!pair) continue;
+
+      results.push(pair);
+    } catch (err) {
+      console.log("Trending resolve error:", err.message);
+    }
+  }
+
+  return results
+    .sort((a, b) => rankPairQuality(b) - rankPairQuality(a))
+    .slice(0, 10);
+}
 
   for (const item of boosts) {
     if (!item?.chainId || !item?.tokenAddress) continue;
@@ -3770,7 +3803,11 @@ async function registerHandlers() {
         await showMainMenu(chatId);
       } else if (data === "scan_token") {
         await promptScanToken(chatId);
-      } else if (data === "trending") {
+      } else if if (data === "trending") {
+  await answerCallbackSafe(query.id);
+  await showTrending(chatId);
+  return;
+} {
         await showTrending(chatId);
       } else if (data === "launch_radar") {
         await showLaunchRadar(chatId);
