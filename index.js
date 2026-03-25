@@ -229,7 +229,9 @@ function num(value, fallback = 0) {
   const n = Number(value);
   return Number.isFinite(n) ? n : fallback;
 }
-
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, num(value)));
+}
 function shortUsd(n) {
   const x = num(n);
   if (x >= 1_000_000_000) return `$${(x / 1_000_000_000).toFixed(2)}B`;
@@ -1307,20 +1309,32 @@ function analyzeSolanaHolderConcentration(largestAccounts = []) {
     holdersKnown: largestAccounts.length,
     detail: `Top 1: ${toPct(top1Pct)} | Top 5: ${toPct(top5Pct)} | Top 10: ${toPct(top10Pct)}`
   };
-}
-
 async function fetchEvmHoneypot(address, chainId) {
   if (!address || !isEvmChain(chainId)) return null;
 
   try {
     const chain = String(chainId).toLowerCase();
-    const url = `${HONEYPOT_API_BASE}/v2/IsHoneypot`;
 
-    const res = await axios.get(url, {
+    const res = await axios.get(`${HONEYPOT_API_BASE}/v2/IsHoneypot`, {
       timeout: DEX_TIMEOUT_MS,
       params: {
         address,
         chainID: EVM_CHAIN_IDS[chain]
+      }
+    });
+
+    return res.data || null;
+  } catch (err) {
+    const status = err?.response?.status;
+
+    if (status === 404) {
+      return null;
+    }
+
+    console.log("fetchEvmHoneypot error:", err.message);
+    return null;
+  }
+}
       }
     });
 
@@ -1399,8 +1413,122 @@ function analyzeEvmTopHolders(data) {
     holdersKnown: holders.length,
     detail: `Top 1: ${toPct(top1Pct)} | Top 5: ${toPct(top5Pct)} | Top 10: ${toPct(top10Pct)}`
   };
+}async function fetchHeliusTokenLargestAccounts(mintAddress) {
+  if (!hasHelius() || !mintAddress) {
+    throw new Error("Helius unavailable or mint missing");
+  }
+
+  return retryOperation(
+    "helius-largest-accounts",
+    async () => {
+      const res = await axios.post(
+        `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`,
+        {
+          jsonrpc: "2.0",
+          id: "gorktimus-largest-accounts",
+          method: "getTokenLargestAccounts",
+          params: [mintAddress]
+        },
+        {
+          timeout: HELIUS_TIMEOUT_MS,
+          headers: { "Content-Type": "application/json" }
+        }
+      );
+
+      const rows = res?.data?.result?.value;
+      if (!Array.isArray(rows)) {
+        throw new Error("Helius returned invalid largest accounts payload");
+      }
+
+      return rows;
+    },
+    {
+      attempts: 7,
+      baseDelay: 1200,
+      maxDelay: 12000,
+      backoff: 2,
+      shouldRetry: (err) => {
+        const status = err?.response?.status;
+        return [408, 409, 425, 429, 500, 502, 503, 504].includes(status) ||
+          err.code === "ECONNABORTED" ||
+          err.code === "ENOTFOUND" ||
+          err.code === "ETIMEDOUT";
+      },
+      onRetry: (err, attempt, delay) => {
+        console.log(
+          `fetchHeliusTokenLargestAccounts retry ${attempt} in ${delay}ms:`,
+          err?.response?.status || err.message
+        );
+      }
+    }
+  );
+}
+async function fetchEvmSafetyComposite(address, chainId) {
+  const errors = [];
+
+  try {
+    const honeypot = await fetchEvmHoneypot(address, chainId);
+    return {
+      source: "honeypot",
+      data: honeypot
+    };
+  } catch (err) {
+    errors.push(`honeypot:${err.message}`);
+  }
+
+  try {
+    const goplus = await fetchGoPlusSecurity(address, chainId);
+    return {
+      source: "goplus",
+      data: goplus
+    };
+  } catch (err) {
+    errors.push(`goplus:${err.message}`);
+  }
+const providerHealth = {
+  helius: { success: 0, fail: 0, cooldownUntil: 0 },
+  honeypot: { success: 0, fail: 0, cooldownUntil: 0 },
+  goplus: { success: 0, fail: 0, cooldownUntil: 0 }
+};
+
+function markProviderSuccess(name) {
+  if (!providerHealth[name]) return;
+  providerHealth[name].success += 1;
+}{
+  ok: false,
+  source: "helius",
+  error: "rate_limited"
 }
 
+function markProviderFail(name, err) {
+  if (!providerHealth[name]) return;
+  providerHealth[name].fail += 1;
+
+  const status = err?.response?.status;
+  if (status === 429) {
+    providerHealth[name].cooldownUntil = Date.now() + 60 * 1000;
+  }
+}
+if (!providerAvailable("helius")) {
+  throw new Error("Helius temporarily cooling down");
+}
+function providerAvailable(name) {
+  const p = providerHealth[name];
+  if (!p) return true;
+  return Date.now() >= p.cooldownUntil;
+}
+  try {
+    const heuristic = await buildEvmHeuristicSafety(address, chainId);
+    return {
+      source: "heuristic",
+      data: heuristic
+    };
+  } catch (err) {
+    errors.push(`heuristic:${err.message}`);
+  }
+
+  throw new Error(`All EVM safety providers failed: ${errors.join(" | ")}`);
+}
 async function fetchEtherscanSourceCode(address, chainId) {
   if (!hasEtherscanKey() || !address || !isEvmChain(chainId)) return null;
 
