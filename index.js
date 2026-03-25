@@ -3581,7 +3581,52 @@ async function scanWatchlistAlerts() {
 }
 
 // ================= HANDLERS =================
-async function registerHandlers() {
+async function trackUserActivity(userId) {
+  await run(
+    `INSERT INTO user_activity (user_id, ts) VALUES (?, ?)`,
+    [String(userId), nowTs()]
+  );
+}
+
+async function trackScan(userId) {
+  await run(
+    `INSERT INTO scan_logs (user_id, ts) VALUES (?, ?)`,
+    [String(userId), nowTs()]
+  );
+}
+
+async function getNetworkPulse() {
+  const now = nowTs();
+  const startOfDay = now - 86400;
+  const liveWindow = now - 900;
+
+  const todayUsers = await get(
+    `SELECT COUNT(DISTINCT user_id) as c FROM user_activity WHERE ts >= ?`,
+    [startOfDay]
+  );
+
+  const liveUsers = await get(
+    `SELECT COUNT(DISTINCT user_id) as c FROM user_activity WHERE ts >= ?`,
+    [liveWindow]
+  );
+
+  const scansToday = await get(
+    `SELECT COUNT(*) as c FROM scan_logs WHERE ts >= ?`,
+    [startOfDay]
+  );
+
+  return `⚡ ${todayUsers?.c || 0} today • ${liveUsers?.c || 0} live • ${scansToday?.c || 0} scans`;
+}
+
+async function showMainMenu(chatId) {
+  const pulse = await getNetworkPulse();
+
+  await sendMenu(
+    chatId,
+    `🧠 <b>Gorktimus Intelligence Terminal</b>\n\n${pulse}\n\nLive intelligence. On-demand execution.\nNo clutter. No spam.\n\nSelect an operation below.`,
+    buildMainMenu()
+  );
+}async function registerHandlers() {
   bot.onText(/\/start/, async (msg) => {
     try {
       if (!isPrivateChat(msg)) return;
