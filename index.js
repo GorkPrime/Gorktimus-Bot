@@ -45,6 +45,8 @@ const TELEGRAM_SEND_RETRY_MS = 900;
 const ETHERSCAN_V2_URL = "https://api.etherscan.io/v2/api";
 const HONEYPOT_API_BASE = "https://api.honeypot.is";
 
+const GORKTIMUS_BUILD_VERSION = "ELITE-FINAL";
+
 const EVM_CHAIN_IDS = {
   ethereum: 1,
   base: 8453
@@ -225,7 +227,7 @@ function humanChain(chainId) {
 }
 
 function buildGeneratedStamp() {
-  return "Generated: just now";
+  return `Generated: just now • ${GORKTIMUS_BUILD_VERSION}`;
 }
 
 function ageMinutesFromMs(createdAtMs) {
@@ -602,7 +604,7 @@ async function sendMenu(chatId, caption, keyboard) {
     "🧠 <b>Gorktimus Intelligence Terminal</b>\n\nLive intelligence. Clean execution.";
 
   try {
-    if (safeCaption.length > 900 || !fs.existsSync(TERMINAL_IMG)) {
+    if (safeCaption.length > 850 || !fs.existsSync(TERMINAL_IMG)) {
       await sendMessageWithRetry(chatId, safeCaption, {
         ...keyboard,
         parse_mode: "HTML",
@@ -1805,7 +1807,12 @@ async function buildPrimePickCandidates(limit = 5) {
 }
 
 async function showPrimePicks(chatId) {
-  const picks = await buildPrimePickCandidates(5);
+  let picks = [];
+  try {
+    picks = await buildPrimePickCandidates(5);
+  } catch (err) {
+    console.log("showPrimePicks fetch error:", err.message);
+  }
 
   if (!picks.length) {
     await sendText(
