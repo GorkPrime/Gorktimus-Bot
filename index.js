@@ -1,6 +1,6 @@
 const TelegramBot = require("node-telegram-bot-api");
 const axios = require("axios");
-const sqlite3 = require("sqlite3").verbsqliteose();
+const sqlite3 = require("sqlite3").verbose();
 const path = require("path");
 const fs = require("fs");
 
