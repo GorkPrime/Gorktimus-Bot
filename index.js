@@ -1,7 +1,4 @@
- * GorKtimus New Update
- * Fresh rebuild from scratch
- * Core stack: Telegram + DexScreener + SQLite + optional Helius
- *
+
  * Required env:
  * TELEGRAM_BOT_TOKEN=...
  * CHANNEL_USERNAME=@yourchannel            // optional membership gate
