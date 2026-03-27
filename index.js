@@ -1,6 +1,12 @@
 const TelegramBot = require("node-telegram-bot-api");
+const OWNER_TELEGRAM_ID = 662870638;
+const DEV_MODE = true;
+
+
+
 const axios = require("axios");
 const liveTokenState = new Map();
+const WebSocket = require("ws");
 const tokenSnapshots = new Map()
 const liveTokenTxs = new Map();
 const activeBirdeyeSubscriptions = new Set();
@@ -19,6 +25,9 @@ function sleep(ms) {
 
 const sqlite3 = require("sqlite3").verbose();
 const path = require("path");
+const PUMP_RECENT_TRADES_LIMIT = 20;
+const PUMP_RECONNECT_DELAY_MS = 3000;
+
 const fs = require("fs");
 function isPrivateChat(msgOrQuery) {
   const chat =
@@ -76,6 +85,10 @@ const pendingAction = new Map();
 let BOT_USERNAME = "";
 const callbackStore = new Map();
 // ================= DB HELPERS =================
+function isOwner(chatId) {
+  return String(chatId) === String(OWNER_TELEGRAM_ID);
+}
+
 async function heliusThrottle() {
   const now = Date.now();
   const wait = Math.max(0, HELIUS_MIN_SPACING_MS - (now - lastHeliusRequestAt));
