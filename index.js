@@ -85,7 +85,7 @@ function all(sql, params = []) {
   });
 }
 // ================= CALLBACK HELPERS =================
-const callbackStore = new Map();
+
 
 function makeShortCallback(action, payload) {
   const id = Math.random().toString(36).slice(2, 10);
