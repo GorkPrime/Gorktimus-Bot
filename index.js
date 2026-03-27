@@ -2264,6 +2264,20 @@ bot.onText(/\/start/, async (msg) => {
 
 // ================= MESSAGE FLOW =================
 bot.on("message", async (msg) => {
+   const chatId = msg.chat.id;
+
+  if (DEV_MODE) {
+    if (!isPrivateChat(msg)) return;
+
+    if (!isOwner(chatId)) {
+      await sendText(
+        chatId,
+        "🚧 Gorktimus is currently in private development mode."
+      );
+      return;
+    }
+  }
+  
   try {
     if (!isPrivateChat(msg)) return;
     if (!msg?.from?.id || !msg?.chat?.id) return;
