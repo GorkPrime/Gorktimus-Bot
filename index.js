@@ -2226,7 +2226,6 @@ bot.on("callback_query", async (query) => {
   await answerCallbackSafe(query.id);
   return;
 }
-  }
 
   try {
     const ok = await ensureSubscribedOrBlock(query);
