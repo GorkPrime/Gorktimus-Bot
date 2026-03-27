@@ -2321,9 +2321,21 @@ if (data.startsWith("watch_rescan:")) {
     if (data === "check_subscription") return showMainMenu(chatId);
 
     if (data === "help_engine") {
-      return sendText(chatId, `🧠 <b>How Gorktimus Works</b>\n\nGorktimus scans live pairs, scores structure, reads liquidity, flow, holder concentration, transparency, and trap risk, then turns it into plain-language guidance.`, buildHelpMenu());
+      return sendText(chatId, `🧠 <b>How Gorktimus Works</b>\n\nGorktimus is built as a live crypto intelligence terminal, not a simple market mirror.`,
+    ``,
+    `The stack does three different jobs:`,
+    `• discovers active pairs`,
+    `• scores structural risk and opportunity`,
+    `• explains the result in plain language`,
+    ``,
+    `That means it is trying to answer a harder question than “what is moving?”`,
+    `It is trying to answer “what is moving, how clean is it, and what could be hiding underneath that movement?”`,
+    ``,
+    `So when you scan a token, you are not just getting price and liquidity. You are also getting holder concentration context, contract transparency clues, behavior signals, memory bias from prior outcomes, and mode-aware score shaping., buildHelpMenu());
     }
-Dex is a raw activity feed.`,
+    
+    if (data === "help_dex_diff") {
+      return sendText(chatId, `🧠 <b>Why Gorktimus Differs From Dex</b>\n\nDex is a raw activity feed.`,
     `Gorktimus is a filtered intelligence layer.`,
     ``,
     `Dex can surface tokens because they are simply loud:`,
