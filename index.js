@@ -1046,10 +1046,6 @@ async function fetchPairsByToken(chainId, tokenAddress) {
   const pairs = Array.isArray(data) ? data : [];
   return pairs.map(normalizePair).filter((p) => p && supportsChain(p.chainId));
 }
-
-> gorktimus-prime-bot@1.0.0 start
-/app/index.js:1050
-> node index.js
   const cached = pairCache.get(cacheKey);
                  ^
 ReferenceError: pairCache is not defined
