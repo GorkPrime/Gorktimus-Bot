@@ -30,7 +30,7 @@ const PUMP_RECONNECT_DELAY_MS = 3000;
 
 const fs = require("fs");
 
-}
+
 function isPrivateChat(msgOrQuery) {
   const chat =
     msgOrQuery?.chat ||
