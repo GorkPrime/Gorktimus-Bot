@@ -1143,7 +1143,6 @@ async function fetchHeliusTokenLargestAccounts(mint) {
 
       throw err;
     }
-  }
 
   console.warn(`Helius largest accounts skipped for ${mint} after retries`);
   return null;
