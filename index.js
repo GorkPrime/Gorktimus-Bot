@@ -2355,8 +2355,14 @@ bot.on("callback_query", async (query) => {
       await answerCallbackSafe(query.id);
       return;
     }
-    await runTokenScan(chatId, tokenAddress, userId);
-}
+
+    if (data.startsWith("watch_rescan:")) {
+      const parts = data.split(":");
+      const tokenAddress = parts[2];
+      await answerCallbackSafe(query.id);
+      return await runTokenScan(chatId, tokenAddress, userId);
+    }
+
     await answerCallbackSafe(query.id);
 
     if (data === "main_menu") return showMainMenu(chatId);
