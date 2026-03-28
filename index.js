@@ -2206,33 +2206,7 @@ async function showAIAssistant(chatId) {
     buildAIAssistantMenu()
   );
 }
-bot.on("message", async (msg) => {
-  try {
-    if (!isPrivateChat(msg)) return;
-    if (!msg?.from?.id || !msg?.chat?.id) return;
-    if (msg.text && msg.text.startsWith("/start")) return;
 
-    const ok = await ensureSubscribedOrBlock(msg);
-    await upsertUserFromMessage(msg, ok ? 1 : 0);
-    await ensureUserSettings(msg.from.id);
-    await trackUserActivity(msg.from.id);
-    if (!ok) return;
-
-    const chatId = msg.chat.id;
-    const cleaned = String(msg.text || "").trim();
-    if (!cleaned) return;
-
-    const pending = pendingAction.get(chatId);
-
-    if (pending?.type === "AI") {
-      const reply = await askAI(cleaned);
-      await sendText(
-        chatId,
-        `🤖 <b>Gorktimus AI Assistant</b>\n\n${escapeHtml(reply)}`,
-        buildAIAssistantMenu()
-      );
-      return;
-    }
 bot.on("message", async (msg) => {
   try {
     if (!isPrivateChat(msg)) return;
