@@ -374,9 +374,12 @@ function ageFromMs(createdAtMs) {
   const diffMin = Math.floor(diffSec / 60);
   const diffHrs = Math.floor(diffMin / 60);
   const diffDays = Math.floor(diffHrs / 24);
-  if (diffMin < 60) return `${diffMin}m`;
-  if (diffHrs < 24) return `${diffHrs}h`;
-  return `${diffDays}d`;
+  
+  // Show seconds for under 1 minute
+  if (diffSec < 60) return `${diffSec}s`;
+  if (diffMin < 60) return `${diffMin}m ${diffSec % 60}s`;
+  if (diffHrs < 24) return `${diffHrs}h ${diffMin % 60}m`;
+  return `${diffDays}d ${diffHrs % 24}h`;
 }
 
 function isAddressLike(text) {
