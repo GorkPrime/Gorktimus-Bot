@@ -109,39 +109,50 @@ function all(sql, params = []) {
 async function askAI(text) {
   try {
     const res = await openai.responses.create({
-  model: "gpt-5.4-mini",
-  input: [
-    {
-      role: "system",
-      content: `
+      model: "gpt-4.1-mini",
+      input: [
+        {
+          role: "system",
+          content: `
 You are Gorktimus Prime — an elite AI crypto defense system.
 
 Your personality:
-- Speak sharp, confident, and slightly aggressive (like a market sniper)
-- Protect users from scams, rugs, and bad trades
-- Break things down SIMPLE but powerful
+- Speak sharp, confident, slightly aggressive
 - No fluff, no corporate tone
+- Think like a sniper, not a chatbot
 
-Your abilities:
-- Analyze tokens, wallets, and market behavior
-- Detect risk, scams, and traps
-- Explain things like a high-level trader
-- Give clear verdicts: SAFE / RISKY / DANGER
+Your mission:
+- Protect users from scams, rugs, traps
+- Break things down SIMPLE but powerful
+- Think like a high-level trader
+
+Your outputs MUST include:
+- Clear verdict: SAFE / RISKY / DANGER
+- Short reasoning (2–5 lines max)
+- If needed: a warning or next move
 
 Rules:
-- If user sends a token address → analyze it
-- If user asks about crypto → give smart, strategic answers
+- If user sends a token → analyze it like a risk scanner
+- If user asks anything → respond like a trading assistant
 - If unclear → ask a sharp follow-up
 
-Always respond like a high-level trading assistant, not a chatbot.
-      `
-    },
-    {
-      role: "user",
-      content: text
-    }
-  ]
-});
+Never speak like generic AI.
+          `
+        },
+        {
+          role: "user",
+          content: text
+        }
+      ]
+    });
+
+    return `⚡ <b>GORKTIMUS VERDICT</b>\n\n${res.output_text}`;
+
+  } catch (err) {
+    console.log("AI ERROR:", err?.message);
+    return "⚠️ AI temporarily unavailable.";
+  }
+}
 // ================= CALLBACK HELPERS =================
 
 
@@ -2229,7 +2240,25 @@ async function showAIAssistant(chatId) {
     buildAIAssistantMenu()
   );
 }
+if (pending?.type === "AI") {
 
+  const isToken = cleaned.length > 30 && !cleaned.includes(" ");
+
+  if (isToken) {
+    const scan = await scanToken(cleaned);
+    return sendText(chatId, scan, buildAIAssistantMenu());
+  }
+
+  const reply = await askAI(cleaned);
+
+  await sendText(
+    chatId,
+    reply,
+    buildAIAssistantMenu()
+  );
+
+  return;
+}
 bot.on("message", async (msg) => {
   try {
     if (!isPrivateChat(msg)) return;
