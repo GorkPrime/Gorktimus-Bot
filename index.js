@@ -2237,9 +2237,9 @@ bot.on("message", async (msg) => {
   try {
     if (!isPrivateChat(msg)) return;
     if (!msg?.from?.id || !msg?.chat?.id) return;
-    
     if (msg.text && msg.text.startsWith("/start")) return;
 
+    const ok = await ensureSubscribedOrBlock(msg);
     await upsertUserFromMessage(msg, ok ? 1 : 0);
     await ensureUserSettings(msg.from.id);
     await trackUserActivity(msg.from.id);
