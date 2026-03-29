@@ -298,7 +298,7 @@ async function initDb() {
         method: "getTokenLargestAccounts",
         params: [mint]
       }, {
-        timeout: 15000
+        timeout: 4000
       });
 
       const data = res.data?.result?.value || [];
@@ -1107,7 +1107,7 @@ async function resolveBestPair(query, forceFresh = false) {
   const now = Date.now();
   const cached = pairCache.get(cacheKey);
 
-  if (!forceFresh && cached && now - cached.ts < 5000) {
+  if (!forceFresh && cached && now - cached.ts < 20000 ) {
     return cached.data;
   }
 
