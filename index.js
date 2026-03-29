@@ -2142,7 +2142,7 @@ async function showTrending(chatId, userId = null) {
   const boosts = await fetchLatestBoosts();
   const top = boosts
     .filter((x) => supportsChain(x.chainId))
-    .slice(0, 8);
+    .slice(0, 10);
 
   if (!top.length) {
     await sendText(
@@ -2156,16 +2156,20 @@ async function showTrending(chatId, userId = null) {
   const lines = [
     `🧠 <b>Trending</b>`,
     ``,
-    `This list is not meant to match Dex line-for-line. It is a quick live discovery layer.`
+    `This list is not meant to match Dex line-for-line. It is a quick live discovery layer. A Live momentum board ranked by current attention, chain activity, and surface strength — not just hype alone.`
   ];
 
   const buttons = [];
-  for (const item of top) {
-    const chainId = String(item.chainId || "").toLowerCase();
-    const tokenAddress = String(item.tokenAddress || "");
-    const amount = num(item.amount);
-    lines.push(`• <b>${escapeHtml(item.tokenAddress ? shortAddr(tokenAddress, 6) : "Candidate")}</b> | ${escapeHtml(humanChain(chainId))} | boost ${amount}`);
+  for (const [index, item] of top.entries()) {
+  const chainId = String(item.chainId || "").toLowerCase();
+  const tokenAddress = String(item.tokenAddress || "");
+  const amount = num(item.amount);
 
+  lines.push(
+    `#${index + 1} <b>${escapeHtml(item.tokenAddress ? shortAddr(tokenAddress, 6) : "Candidate")}</b> • ${escapeHtml(humanChain(chainId))}\n` +
+    `Boost: ${amount}\n` +
+    `${amount >= 500 ? `Heavy attention signal detected.` : `Moderate attention signal — momentum needs validation.`}\n`
+  );
     if (tokenAddress) {
       buttons.push([{
         text: `🔎 Scan ${clip(shortAddr(tokenAddress, 6), 22)}`,
@@ -2194,7 +2198,7 @@ async function showLaunchRadar(chatId) {
     if (pair.liquidityUsd >= LAUNCH_MIN_LIQ_USD && pair.volumeH24 >= LAUNCH_MIN_VOL_USD && ageMin <= 1440) {
       candidates.push(pair);
     }
-    if (candidates.length >= 8) break;
+    if (candidates.length >= 3) break;
   }
 
   if (!candidates.length) {
@@ -2209,14 +2213,16 @@ async function showLaunchRadar(chatId) {
   const lines = [
     `🧠 <b>Launch Radar</b>`,
     ``,
-    `Fresh candidates meeting minimum liquidity and volume filters.`
+    `These are more than just newly realeased tokens. These are the earliest live opportunities with enough liquidity, movement, and structure to deserve attention. `
   ];
 
   const buttons = [];
-  for (const pair of candidates) {
-    lines.push(
-      `• <b>${escapeHtml(pair.baseSymbol || "N/A")}</b> | ${shortUsd(pair.liquidityUsd)} liq | ${shortUsd(pair.volumeH24)} vol | ${ageFromMs(pair.pairCreatedAt)}`
-    );
+ for (const [index, pair] of candidates.entries()) {
+  lines.push(
+    `#${index + 1} <b>${escapeHtml(pair.baseSymbol || "N/A")}</b> • ${escapeHtml(humanChain(pair.chainId))}\n` +
+    `Liq: ${shortUsd(pair.liquidityUsd)} | Vol: ${shortUsd(pair.volumeH24)} | Age: ${ageFromMs(pair.pairCreatedAt)}\n` +
+    `${pair.volumeH24 >= (pair.liquidityUsd * 1.5) ? `Strong early flow relative to liquidity.` : `Early activity detected, but still needs confirmation.`}\n`
+  );
     buttons.push([{
       text: `🔎 Scan ${clip(pair.baseSymbol || shortAddr(pair.baseAddress, 6), 22)}`,
       callback_data: `scan_direct:${pair.chainId}:${pair.baseAddress}`
@@ -2248,7 +2254,7 @@ async function showPrimePicks(chatId) {
     ) {
       picks.push(pair);
     }
-    if (picks.length >= 8) break;
+    if (picks.length >= 5) break;
   }
 
   if (!picks.length) {
@@ -2263,14 +2269,16 @@ async function showPrimePicks(chatId) {
   const lines = [
     `🧠 <b>Prime Picks</b>`,
     ``,
-    `Candidates with stronger baseline liquidity, volume, and age structure.`
+    `Highest-conviction live setups ranked by stronger liquidity, volume support, and overall structural quality. Thank Us Later`
   ];
 
   const buttons = [];
-  for (const pair of picks) {
-    lines.push(
-      `• <b>${escapeHtml(pair.baseSymbol || "N/A")}</b> | ${shortUsd(pair.liquidityUsd)} liq | ${shortUsd(pair.volumeH24)} vol | ${ageFromMs(pair.pairCreatedAt)}`
-    );
+for (const [index, pair] of picks.entries()) {
+  lines.push(
+    `#${index + 1} <b>${escapeHtml(pair.baseSymbol || "N/A")}</b> • ${escapeHtml(humanChain(pair.chainId))}\n` +
+    `Liq: ${shortUsd(pair.liquidityUsd)} | Vol: ${shortUsd(pair.volumeH24)} | Age: ${ageFromMs(pair.pairCreatedAt)}\n` +
+    `${pair.liquidityUsd >= PRIME_MIN_LIQ_USD * 2 ? `Deeper structure than average current candidates.` : `Qualified setup, but not top-tier depth yet.`}\n`
+  );
     buttons.push([{
       text: `🔎 Scan ${clip(pair.baseSymbol || shortAddr(pair.baseAddress, 6), 22)}`,
       callback_data: `scan_direct:${pair.chainId}:${pair.baseAddress}`
