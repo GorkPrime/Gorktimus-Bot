@@ -294,14 +294,8 @@ async function initDb() {
     await run(`ALTER TABLE user_settings ADD COLUMN last_scan_query TEXT DEFAULT ''`);
   } catch (_) {}
 }
-  try {
-  async function runMigrations() {
-  try {
+   try {
     await run(`ALTER TABLE users ADD COLUMN plan_tier TEXT DEFAULT 'free'`);
-  } catch (e) {
-    console.log("plan_tier may already exist");
-  }
-}
   } catch (_) {}
 
   try {
@@ -323,7 +317,7 @@ async function initDb() {
   try {
     await run(`ALTER TABLE users ADD COLUMN early_access INTEGER DEFAULT 0`);
   } catch (_) {}
-
+}
 
 // ================= BASIC HELPERS =================
 
