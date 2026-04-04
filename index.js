@@ -823,11 +823,17 @@ async function ensureSubscribedOrBlock(msgOrQuery) {
   const chatId = msgOrQuery.message?.chat?.id || msgOrQuery.chat?.id;
   if (!from?.id || !chatId) return false;
   
-  // ✅ ADD: Enforce DEV_MODE early
+  // ✅ DEV MODE: Owner bypasses all checks
+  if (DEV_MODE && String(from.id) === OWNER_USER_ID) {
+    return true;
+  }
+  
+  // ✅ DEV MODE: Non-owners blocked
   if (DEV_MODE && String(from.id) !== OWNER_USER_ID) {
     return false;
   }
   
+  // Normal mode: Check subscription
   const ok = await isUserSubscribed(from.id);
   if (!ok) {
     await showSubscriptionRequired(chatId);
@@ -2616,25 +2622,31 @@ async function handleRefresh(chatId, userId, key) {
   if (key === "invite") return showInviteFriends(chatId);
 }
 
-// ================= COMMANDS =================
-// ================= COMMANDS =================
-bot.onText(/\/start/, async (msg) => {
-  try {
-    if (DEV_MODE && String(msg.from?.id) !== OWNER_USER_ID) {
-      await sendText(msg.chat.id, "🚫 Development mode. Access denied.");
-      return;
-    }
 
-    const ok = await ensureSubscribedOrBlock(msg);
-    await upsertUserFromMessage(msg, ok ? 1 : 0);
-    await ensureUserSettings(msg.from.id);
-    await trackUserActivity(msg.from.id);
-    if (!ok) return;
-    await showMainMenu(msg.chat.id);
-  } catch (err) {
-    console.log("/start error:", err.message);
+// ================= COMMANDS =================
+async function ensureSubscribedOrBlock(msgOrQuery) {
+  const from = msgOrQuery.from;
+  const chatId = msgOrQuery.message?.chat?.id || msgOrQuery.chat?.id;
+  if (!from?.id || !chatId) return false;
+  
+  // ✅ DEV MODE: Owner bypasses all checks
+  if (DEV_MODE && String(from.id) === OWNER_USER_ID) {
+    return true;
   }
-});
+  
+  // ✅ DEV MODE: Non-owners blocked
+  if (DEV_MODE && String(from.id) !== OWNER_USER_ID) {
+    return false;
+  }
+  
+  // Normal mode: Check subscription
+  const ok = await isUserSubscribed(from.id);
+  if (!ok) {
+    await showSubscriptionRequired(chatId);
+    return false;
+  }
+  return true;
+}
 
 // ================= MESSAGE HANDLER =================
 async function showAIAssistant(chatId) {
