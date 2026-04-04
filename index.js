@@ -2617,16 +2617,15 @@ async function getTelegramPhotoUrl(photo) {
   return `https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`;
 }
 bot.on("message", async (msg) => {
-  try {if (DEV_MODE && String(msg.from?.id) !== OWNER_USER_ID) {
-  return; 
+  try {
+    if (DEV_MODE && String(msg.from?.id) !== OWNER_USER_ID) {
+      return;
+    }
+
     if (!isPrivateChat(msg)) return;
     if (!msg?.from?.id || !msg?.chat?.id) return;
     if (msg.text && msg.text.startsWith("/start")) return;
-    if (DEV_MODE && String(query.from?.id) !== OWNER_USER_ID) {
-  await answerCallbackSafe(query.id, "🚫 Terminal in development.");
-  return;
-}
-}
+
     const ok = await ensureSubscribedOrBlock(msg);
     await upsertUserFromMessage(msg, ok ? 1 : 0);
     await ensureUserSettings(msg.from.id);
@@ -2634,13 +2633,14 @@ bot.on("message", async (msg) => {
     if (!ok) return;
 
     const chatId = msg.chat.id;
-  const cleaned = String(msg.text || msg.caption || "").trim();
-const hasPhoto = Array.isArray(msg.photo) && msg.photo.length > 0;
-let imageUrl = null;
+    const cleaned = String(msg.text || msg.caption || "").trim();
+    const hasPhoto = Array.isArray(msg.photo) && msg.photo.length > 0;
+    let imageUrl = null;
 
-if (hasPhoto) {
-  imageUrl = await getTelegramPhotoUrl(msg.photo);
-}
+    if (hasPhoto) {
+      imageUrl = await getTelegramPhotoUrl(msg.photo);
+    }
+
 if (!cleaned && !hasPhoto) return;
 
 
@@ -2720,23 +2720,22 @@ console.log(err.stack);
 // ================= CALLBACKS =================
 bot.on("callback_query", async (query) => {
   if (DEV_MODE && String(query.from?.id) !== OWNER_USER_ID) {
-  try {
-    await answerCallbackSafe(query.id, "🚫 Terminal in development.");
-  } catch (e) {
-    console.log("DEV BLOCK ERROR:", e.message);
+    try {
+      await answerCallbackSafe(query.id, "🚫 Terminal in development.");
+    } catch (e) {
+      console.log("DEV BLOCK ERROR:", e.message);
+    }
+    return;
   }
-  return;
-}
+
   const chatId = query?.message?.chat?.id;
   const userId = query?.from?.id;
   const data = String(query?.data || "");
-if (DEV_MODE && String(msg.from?.id) !== OWNER_USER_ID) {
-  return; 
+
   if (!isPrivateChat(query)) {
     await answerCallbackSafe(query.id);
     return;
   }
- 
 
   try {
     const ok = await ensureSubscribedOrBlock(query);
