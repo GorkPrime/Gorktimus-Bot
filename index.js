@@ -1,6 +1,6 @@
 const TelegramBot = require("node-telegram-bot-api");
 const axios = require("axios");
-const DEV_MODE = true;
+const DEV_MODE = process.env.DEV_MODE === "true";
 const OpenAI = require("openai");
 
 const openai = new OpenAI({
