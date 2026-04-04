@@ -2741,15 +2741,11 @@ bot.on("callback_query", async (query) => {
       return;
     }
 
-    if (data.startsWith("watch_rescan:")) {
+  if (data.startsWith("watch_rescan:")) {
   const parts = data.split(":");
   const chainId = parts[1];
   const tokenAddress = parts[2];
-  
-  if (!chainId || !tokenAddress) {
-    await answerCallbackSafe(query.id);
-    return sendText(chatId, `Invalid rescan data.`, buildMainMenuOnlyButton("refresh:watchlist"));
- 
+  await answerCallbackSafe(query.id);
   return await runTokenScan(chatId, tokenAddress, userId);
 }
 
@@ -3001,26 +2997,30 @@ if (data.startsWith("feedbackbad:")) {
       return handleWatchOpen(chatId, userId, chainId, tokenAddress);
     }
 
-    if (data.startsWith("watch_rescan:")) {
-      const [, chainId, tokenAddress] = data.split(":");
-      return runTokenScan(chatId, tokenAddress, userId);
-    }
-
-    if (data.startsWith("watch_remove:")) {
-      const [, chainId, tokenAddress] = data.split(":");
-      await removeWatchlistItem(chatId, chainId, tokenAddress);
-      return showWatchlist(chatId);
-    }
-
-    if (data.startsWith("feedback:")) {
-      const [, feedback, chainId, tokenAddress] = data.split(":");
-      const pair = await resolveTokenToBestPair(chainId, tokenAddress);
-      if (!pair) return sendText(chatId, `Could not resolve token for feedback save.`, buildMainMenuOnlyButton());
-      const verdict = await buildRiskVerdict(pair, userId);
-      await addScanFeedback(userId, pair, feedback, verdict.score);
-      return sendText(chatId, `🧠 <b>Feedback Saved</b>\n\nMarked as: <b>${escapeHtml(feedback)}</b>`, buildMainMenuOnlyButton());
-    }
-
+  
+if (data.startsWith("watch_remove:")) {
+  const [, chainId, tokenAddress] = data.split(":");
+  if (!chainId || !tokenAddress) {
+    return sendText(chatId, `Invalid removal data.`, buildMainMenuOnlyButton("refresh:watchlist"));
+  }
+  await removeWatchlistItem(chatId, chainId, tokenAddress);
+  return showWatchlist(chatId);
+}if (data.startsWith("feedback:")) {
+  const parts = data.split(":");
+  const feedback = parts[1];
+  const chainId = parts[2];
+  const tokenAddress = parts[3];
+  
+  if (!feedback || !chainId || !tokenAddress) {
+    return sendText(chatId, `Invalid feedback data.`, buildMainMenuOnlyButton());
+  }
+  
+  const pair = await resolveTokenToBestPair(chainId, tokenAddress);
+  if (!pair) return sendText(chatId, `Could not resolve token for feedback save.`, buildMainMenuOnlyButton());
+  const verdict = await buildRiskVerdict(pair, userId);
+  await addScanFeedback(userId, pair, feedback, verdict.score);
+  return sendText(chatId, `🧠 <b>Feedback Saved</b>\n\nMarked as: <b>${escapeHtml(feedback)}</b>`, buildMainMenuOnlyButton());
+}
     if (data.startsWith("refresh_scan:")) {
       const queryText = decodeURIComponent(data.split(":")[1] || "");
       return runTokenScan(chatId, queryText, userId);
