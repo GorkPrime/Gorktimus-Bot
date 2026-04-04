@@ -366,7 +366,7 @@ async function initDb() {
 
       if (status === 429) {
         tries += 1;
-        await sleep(1500 * tries);
+        await sleep(300 * tries);
         continue;
       }
 
@@ -1214,13 +1214,19 @@ async function fetchPairsByToken(chainId, tokenAddress) {
       `https://api.dexscreener.com/token-pairs/v1/${encodeURIComponent(chainId)}/${encodeURIComponent(tokenAddress)}`
     );
     
-    // DexScreener returns { pairs: [...] } structure
-    const pairs = Array.isArray(data) ? data : (Array.isArray(data?.pairs) ? data.pairs : []);
+    // Handle both direct array and wrapped structure
+    let pairs = [];
+    if (Array.isArray(data)) {
+      pairs = data;
+    } else if (data?.pairs && Array.isArray(data.pairs)) {
+      pairs = data.pairs;
+    }
     
     if (!pairs.length) return [];
     
-    // Filter for supported chains and ensure proper fields
+    // CRITICAL: Filter out incomplete pairs before normalizing
     return pairs
+      .filter(p => p.pairAddress && p.baseToken?.address) // ✅ Verify essential fields
       .map(normalizePair)
       .filter((p) => p && supportsChain(p.chainId) && p.baseAddress && p.pairAddress);
   } catch (err) {
@@ -1721,12 +1727,16 @@ if (chain === "solana") {
   };
 }
   else if (isEvmChain(chain)) {
-    const [honeypotData, topHoldersData, etherscanData] = await Promise.all([
-      fetchEvmHoneypot(pair.baseAddress, chain),
-      fetchEvmTopHolders(pair.baseAddress, chain),
-      fetchEtherscanSourceCode(pair.baseAddress, chain)
-    ]);
+  const fetchWithTimeout = (promise, ms) => Promise.race([
+  promise,
+  new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), ms))
+]);
 
+const [honeypotData, topHoldersData, etherscanData] = await Promise.all([
+  fetchWithTimeout(fetchEvmHoneypot(pair.baseAddress, chain), 3000),
+  fetchWithTimeout(fetchEvmTopHolders(pair.baseAddress, chain), 3000),
+  fetchWithTimeout(fetchEtherscanSourceCode(pair.baseAddress, chain), 3000)
+]).catch(() => [null, null, null]);
     if (honeypotData?.summary) {
       const risk = String(honeypotData.summary.risk || "").toLowerCase();
       const riskLevel = num(honeypotData.summary.riskLevel, 0);
