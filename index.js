@@ -1,6 +1,6 @@
 const TelegramBot = require("node-telegram-bot-api");
 const axios = require("axios");
-const DEV_MODE = process.env.DEV_MODE === "true";
+const DEV_MODE = process.env.DEV_MODE === "true"; 
 const OpenAI = require("openai");
 
 const openai = new OpenAI({
@@ -2736,10 +2736,7 @@ if (DEV_MODE && String(msg.from?.id) !== OWNER_USER_ID) {
     await answerCallbackSafe(query.id);
     return;
   }
-  if (DEV_MODE && String(query.from?.id) !== OWNER_USER_ID) {
-  await answerCallbackSafe(query.id, "🚫 Terminal in development.");
-  return;
-}
+ 
 
   try {
     const ok = await ensureSubscribedOrBlock(query);
