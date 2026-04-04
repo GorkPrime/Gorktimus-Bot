@@ -2640,12 +2640,9 @@ bot.on("message", async (msg) => {
     if (hasPhoto) {
       imageUrl = await getTelegramPhotoUrl(msg.photo);
     }
-
-if (!cleaned && !hasPhoto) return;
-
-
+    if (!cleaned && !hasPhoto) return;
     const pending = pendingAction.get(chatId);
-
+   
     if (pending?.type === "SCAN_TOKEN") {
       pendingAction.delete(chatId);
       await runTokenScan(chatId, cleaned, msg.from.id);
