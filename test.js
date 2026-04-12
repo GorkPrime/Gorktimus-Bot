@@ -324,6 +324,164 @@ async function main() {
   });
 
   // ────────────────────────────────────────────────────────────────────────────
+  // WATCHLIST TESTS
+  // ────────────────────────────────────────────────────────────────────────────
+  console.log("\nWATCHLIST");
+
+  async function makeWatchlistDb() {
+    const { run, get, all, close } = makeDb();
+
+    await run(`
+      CREATE TABLE IF NOT EXISTS watchlist (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id TEXT NOT NULL,
+        chain_id TEXT NOT NULL,
+        token_address TEXT NOT NULL,
+        symbol TEXT,
+        pair_address TEXT,
+        active INTEGER DEFAULT 1,
+        alerts_enabled INTEGER DEFAULT 1,
+        added_price REAL DEFAULT 0,
+        last_price REAL DEFAULT 0,
+        last_liquidity REAL DEFAULT 0,
+        last_volume REAL DEFAULT 0,
+        last_score INTEGER DEFAULT 0,
+        last_alert_ts INTEGER DEFAULT 0,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        UNIQUE(chat_id, chain_id, token_address)
+      )
+    `);
+
+    function nowTs() {
+      return Math.floor(Date.now() / 1000);
+    }
+
+    function num(v) {
+      const n = parseFloat(v);
+      return isNaN(n) ? 0 : n;
+    }
+
+    async function addWatchlistItem(chatId, pair) {
+      const ts = nowTs();
+      await run(
+        `INSERT INTO watchlist (chat_id, chain_id, token_address, symbol, pair_address, active, alerts_enabled, added_price, last_price, last_liquidity, last_volume, last_score, last_alert_ts, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, 1, 1, ?, ?, ?, ?, 0, 0, ?, ?)
+         ON CONFLICT(chat_id, chain_id, token_address) DO UPDATE SET
+           symbol = excluded.symbol,
+           pair_address = excluded.pair_address,
+           last_price = excluded.last_price,
+           last_liquidity = excluded.last_liquidity,
+           last_volume = excluded.last_volume,
+           updated_at = excluded.updated_at,
+           active = 1`,
+        [
+          String(chatId),
+          String(pair.chainId || ""),
+          String(pair.baseAddress || ""),
+          String(pair.baseSymbol || ""),
+          String(pair.pairAddress || ""),
+          num(pair.priceUsd),
+          num(pair.priceUsd),
+          num(pair.liquidityUsd),
+          num(pair.volumeH24),
+          ts,
+          ts
+        ]
+      );
+    }
+
+    return { run, get, all, close, addWatchlistItem };
+  }
+
+  await test("addWatchlistItem inserts a new row with all columns populated", async () => {
+    const { get, close, addWatchlistItem } = await makeWatchlistDb();
+
+    const chatId = "111";
+    const pair = {
+      chainId: "solana",
+      baseAddress: "TokenAddr1",
+      baseSymbol: "GORK",
+      pairAddress: "PairAddr1",
+      priceUsd: "0.005",
+      liquidityUsd: "50000",
+      volumeH24: "12000"
+    };
+
+    await addWatchlistItem(chatId, pair);
+
+    const row = await get(`SELECT * FROM watchlist WHERE chat_id = ? AND token_address = ?`, [chatId, pair.baseAddress]);
+    assert.ok(row, "Row should exist after insert");
+    assert.strictEqual(row.chat_id, chatId);
+    assert.strictEqual(row.chain_id, "solana");
+    assert.strictEqual(row.token_address, "TokenAddr1");
+    assert.strictEqual(row.symbol, "GORK");
+    assert.strictEqual(row.pair_address, "PairAddr1");
+    assert.strictEqual(row.active, 1);
+    assert.strictEqual(row.alerts_enabled, 1);
+    assert.ok(row.added_price > 0, "added_price should be set");
+    assert.ok(row.last_price > 0, "last_price should be set");
+    assert.ok(row.last_liquidity > 0, "last_liquidity should be set");
+    assert.ok(row.last_volume > 0, "last_volume should be set");
+    assert.ok(row.created_at > 0, "created_at should be set");
+    assert.ok(row.updated_at > 0, "updated_at should be set");
+
+    await close();
+  });
+
+  await test("addWatchlistItem upserts on duplicate (chat_id, chain_id, token_address)", async () => {
+    const { get, close, addWatchlistItem } = await makeWatchlistDb();
+
+    const chatId = "222";
+    const pair = {
+      chainId: "solana",
+      baseAddress: "TokenAddr2",
+      baseSymbol: "GORK",
+      pairAddress: "PairAddr2",
+      priceUsd: "0.01",
+      liquidityUsd: "10000",
+      volumeH24: "5000"
+    };
+
+    await addWatchlistItem(chatId, pair);
+
+    const updatedPair = { ...pair, baseSymbol: "GORK2", priceUsd: "0.02", liquidityUsd: "20000", volumeH24: "9000" };
+    await addWatchlistItem(chatId, updatedPair);
+
+    const row = await get(`SELECT * FROM watchlist WHERE chat_id = ? AND token_address = ?`, [chatId, pair.baseAddress]);
+    assert.ok(row, "Row should still exist after upsert");
+    assert.strictEqual(row.symbol, "GORK2", "symbol should be updated");
+    assert.ok(Math.abs(row.last_price - 0.02) < 0.0001, "last_price should be updated");
+    assert.ok(Math.abs(row.last_liquidity - 20000) < 1, "last_liquidity should be updated");
+    assert.ok(Math.abs(row.last_volume - 9000) < 1, "last_volume should be updated");
+
+    await close();
+  });
+
+  await test("addWatchlistItem handles multiple tokens for the same chat", async () => {
+    const { all, close, addWatchlistItem } = await makeWatchlistDb();
+
+    const chatId = "333";
+    const pairs = [
+      { chainId: "solana", baseAddress: "Token_A", baseSymbol: "AAA", pairAddress: "Pair_A", priceUsd: "1", liquidityUsd: "1000", volumeH24: "500" },
+      { chainId: "solana", baseAddress: "Token_B", baseSymbol: "BBB", pairAddress: "Pair_B", priceUsd: "2", liquidityUsd: "2000", volumeH24: "1000" },
+      { chainId: "ethereum", baseAddress: "Token_C", baseSymbol: "CCC", pairAddress: "Pair_C", priceUsd: "3", liquidityUsd: "3000", volumeH24: "1500" }
+    ];
+
+    for (const pair of pairs) {
+      await addWatchlistItem(chatId, pair);
+    }
+
+    const rows = await all(`SELECT * FROM watchlist WHERE chat_id = ? AND active = 1 ORDER BY id ASC`, [chatId]);
+    assert.strictEqual(rows.length, 3, "Three distinct tokens should be stored");
+    assert.strictEqual(rows[0].symbol, "AAA");
+    assert.strictEqual(rows[1].symbol, "BBB");
+    assert.strictEqual(rows[2].symbol, "CCC");
+
+    await close();
+  });
+
+  // ────────────────────────────────────────────────────────────────────────────
 
   summary();
 }
