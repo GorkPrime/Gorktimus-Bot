@@ -2209,7 +2209,7 @@ async function buildScanCard(pair, heading, userId = null) {
     `🎯 <b>Confidence:</b> ${escapeHtml(verdict.confidenceMeta.confidence)} (${escapeHtml(verdict.confidenceMeta.checksText)})`,
     verdict.confidenceMeta.confidence === "Low" ? `⚠️ <i>Limited data available — token may be too new or partially indexed.</i>` : ``,
     ``,
-    `⚠️ <b>Risk Rank:</b> ${escapeHtml(riskRankEmoji(verdict.riskRank))}`,
+    `⚠️ <b>Dev Wallet Risk:</b> ${escapeHtml(riskRankEmoji(verdict.riskRank))}`,
     ``,
     `💧 <b>Liquidity:</b> ${shortUsd(pair.liquidityUsd)} • ${escapeHtml(verdict.liquidity.label)}`,
     `${escapeHtml(verdict.liquidityLock.label)}`,
