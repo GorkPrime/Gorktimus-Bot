@@ -40,6 +40,10 @@ const COMMUNITY_TELEGRAM_URL =
 const REQUIRED_CHANNEL = process.env.REQUIRED_CHANNEL || "";
 const DB_PATH = path.join(__dirname, "gorktimus.db");
 const TERMINAL_IMG = path.join(__dirname, "assets", "gorktimus_terminal.png");
+const OWNER_USER_ID = process.env.OWNER_USER_ID || "";
+const DEV_MODE = process.env.DEV_MODE === "true" && !!OWNER_USER_ID;
+const ENABLE_POLLING = process.env.ENABLE_POLLING !== "false";
+const INSTANCE_LOCK_TTL_MINUTES = Math.max(1, parseInt(process.env.INSTANCE_LOCK_TTL_MINUTES || "720", 10));
 
 if (!BOT_TOKEN) {
   console.error("❌ TELEGRAM_BOT_TOKEN not set");
@@ -94,17 +98,6 @@ const latestBoostsCache = {
 
 const PROFILES_CACHE_TTL_MS = 120000;
 const BOOSTS_CACHE_TTL_MS = 45000;
-
-// ================= DEV MODE =================
-
-function isDevMode() {
-  return process.env.DEV_MODE === "true" && !!process.env.OWNER_USER_ID;
-}
-
-const DEV_MODE = isDevMode();
-const OWNER_USER_ID = process.env.OWNER_USER_ID || "";
-const ENABLE_POLLING = process.env.ENABLE_POLLING !== "false";
-const INSTANCE_LOCK_TTL_MINUTES = Math.max(1, parseInt(process.env.INSTANCE_LOCK_TTL_MINUTES || "720", 10));
 
 // ================= DB HELPERS =================
 function getSessionMemory(chatId) {
