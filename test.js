@@ -1087,6 +1087,98 @@ async function main() {
 
   // ────────────────────────────────────────────────────────────────────────────
 
+  // ────────────────────────────────────────────────────────────────────────────
+  // EARLY ACCESS INTEREST TESTS
+  // ────────────────────────────────────────────────────────────────────────────
+  console.log("\nEARLY ACCESS INTEREST");
+
+  await test("early_access_interest table can be created", async () => {
+    const { run, close } = makeDb();
+    await run(`
+      CREATE TABLE IF NOT EXISTS early_access_interest (
+        user_id    TEXT    PRIMARY KEY,
+        username   TEXT    DEFAULT '',
+        timestamp  INTEGER NOT NULL,
+        clicked_at INTEGER NOT NULL
+      )
+    `);
+    await close();
+  });
+
+  await test("logEarlyAccessInterest inserts a new row", async () => {
+    const { run, get, close } = makeDb();
+    await run(`
+      CREATE TABLE IF NOT EXISTS early_access_interest (
+        user_id    TEXT    PRIMARY KEY,
+        username   TEXT    DEFAULT '',
+        timestamp  INTEGER NOT NULL,
+        clicked_at INTEGER NOT NULL
+      )
+    `);
+    const now = Date.now();
+    await run(
+      `INSERT INTO early_access_interest (user_id, username, timestamp, clicked_at) VALUES (?, ?, ?, ?)`,
+      ["123", "testuser", now, now]
+    );
+    const row = await get(`SELECT * FROM early_access_interest WHERE user_id = ?`, ["123"]);
+    assert.ok(row, "Row should exist");
+    assert.strictEqual(row.user_id, "123");
+    assert.strictEqual(row.username, "testuser");
+    await close();
+  });
+
+  await test("logEarlyAccessInterest upserts on duplicate user_id", async () => {
+    const { run, get, close } = makeDb();
+    await run(`
+      CREATE TABLE IF NOT EXISTS early_access_interest (
+        user_id    TEXT    PRIMARY KEY,
+        username   TEXT    DEFAULT '',
+        timestamp  INTEGER NOT NULL,
+        clicked_at INTEGER NOT NULL
+      )
+    `);
+    const now = Date.now();
+    await run(
+      `INSERT INTO early_access_interest (user_id, username, timestamp, clicked_at) VALUES (?, ?, ?, ?)`,
+      ["456", "user_old", now, now]
+    );
+    const later = now + 1000;
+    await run(
+      `INSERT INTO early_access_interest (user_id, username, timestamp, clicked_at)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(user_id) DO UPDATE SET username = excluded.username, clicked_at = excluded.clicked_at`,
+      ["456", "user_new", now, later]
+    );
+    const row = await get(`SELECT * FROM early_access_interest WHERE user_id = ?`, ["456"]);
+    assert.ok(row, "Row should exist after upsert");
+    assert.strictEqual(row.username, "user_new", "Username should be updated");
+    assert.strictEqual(row.clicked_at, later, "clicked_at should be updated");
+    await close();
+  });
+
+  await test("early_access_interest stores empty string when username is absent", async () => {
+    const { run, get, close } = makeDb();
+    await run(`
+      CREATE TABLE IF NOT EXISTS early_access_interest (
+        user_id    TEXT    PRIMARY KEY,
+        username   TEXT    DEFAULT '',
+        timestamp  INTEGER NOT NULL,
+        clicked_at INTEGER NOT NULL
+      )
+    `);
+    const now = Date.now();
+    await run(
+      `INSERT INTO early_access_interest (user_id, username, timestamp, clicked_at) VALUES (?, ?, ?, ?)`,
+      ["789", "", now, now]
+    );
+    const row = await get(`SELECT * FROM early_access_interest WHERE user_id = ?`, ["789"]);
+    assert.ok(row, "Row should exist");
+    assert.strictEqual(row.username, "", "Username should be empty string");
+    await close();
+  });
+
+  // ────────────────────────────────────────────────────────────────────────────
+
   summary();
 }
 

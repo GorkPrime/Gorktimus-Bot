@@ -441,6 +441,15 @@ async function initDb() {
       expires_at INTEGER NOT NULL
     )
   `);
+
+  await run(`
+    CREATE TABLE IF NOT EXISTS early_access_interest (
+      user_id    TEXT    PRIMARY KEY,
+      username   TEXT    DEFAULT '',
+      timestamp  INTEGER NOT NULL,
+      clicked_at INTEGER NOT NULL
+    )
+  `);
 }
 
 // ================= BASIC HELPERS =================
@@ -1122,6 +1131,7 @@ function buildMainMenu() {
       { text: "🤖 AI Assistant", callback_data: "ai_assistant" }
     ],
     [{ text: "❓ Help", callback_data: "help_menu" }],
+    [{ text: "🚀 Early Access", callback_data: "early_access" }],
     [{ text: "🔄 Refresh", callback_data: "refresh:main" }]
   ];
 
@@ -2440,6 +2450,45 @@ async function showInviteFriends(chatId) {
   await sendText(chatId, text, buildMainMenuOnlyButton("refresh:invite"));
 }
 
+async function logEarlyAccessInterest(userId, username) {
+  const now = nowTs();
+  await run(
+    `INSERT INTO early_access_interest (user_id, username, timestamp, clicked_at)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(user_id) DO UPDATE SET username = excluded.username, clicked_at = excluded.clicked_at`,
+    [String(userId), String(username || ""), now, now]
+  );
+}
+
+async function showEarlyAccessMessage(chatId) {
+  const text = [
+    `🚀 <b>Gorktimus Early Access</b>`,
+    ``,
+    `We're preparing to release Deep Analysis Mode — a new intelligence layer designed to:`,
+    ``,
+    `• Detect hidden risks before entry`,
+    `• Filter out rugs and traps automatically`,
+    `• Evaluate real trade viability`,
+    `• Deliver a clear verdict before you trade`,
+    ``,
+    `This feature will be released to a limited group first.`,
+    ``,
+    `<b>How to join:</b>`,
+    `Go to the website and submit:`,
+    `<i>"I want early access"</i>`,
+    `through the Feedback &amp; Support box.`,
+    ``,
+    `Early access users will:`,
+    `• Get first access`,
+    `• Help shape the system`,
+    `• Receive priority upgrades`,
+    ``,
+    `Spots may be prioritized based on activity and engagement.`
+  ].join("\n");
+
+  await sendText(chatId, text, buildMainMenuOnlyButton());
+}
+
 async function promptScanToken(chatId) {
   pendingAction.set(chatId, { type: "SCAN_TOKEN" });
   await sendText(
@@ -3167,6 +3216,14 @@ bot.on("callback_query", async (query) => {
     if (data === "whale_menu") return showWhaleMenu(chatId);
     if (data === "invite_friends") return showInviteFriends(chatId);
     if (data === "check_subscription") return showMainMenu(chatId);
+    if (data === "early_access") {
+      try {
+      await logEarlyAccessInterest(userId, query.from.username ?? query.from.first_name ?? "");
+      } catch (_) {
+        // fail-safe: logging failure must not block message display
+      }
+      return showEarlyAccessMessage(chatId);
+    }
 
    if (data === "help_engine") {
   return sendText(
