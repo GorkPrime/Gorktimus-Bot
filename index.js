@@ -1131,8 +1131,8 @@ function buildMainMenu() {
       { text: "🤖 AI Assistant", callback_data: "ai_assistant" }
     ],
     [{ text: "❓ Help", callback_data: "help_menu" }],
-    [{ text: "🚀 Early Access", callback_data: "early_access" }],
-    [{ text: "🔄 Refresh", callback_data: "refresh:main" }]
+    [{ text: "🔄 Refresh", callback_data: "refresh:main" }],
+    [{ text: "⭐ Early Access", callback_data: "early_access" }]
   ];
 
   if (growthRow.length) keyboard.push(growthRow);
