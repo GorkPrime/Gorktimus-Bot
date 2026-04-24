@@ -104,6 +104,16 @@ const BOOSTS_CACHE_TTL_MS = 45000;
 // the cooldown window.  Key = "${chainId}:${tokenAddress}", value = ms timestamp.
 const launchAlertedTokens = new Map();
 const LAUNCH_TOKEN_ALERT_COOLDOWN_MS = 5 * 60 * 1000; // 5-min per token
+const LAUNCH_MAX_AGE_MINUTES = 1440;              // 24 h — max token age for launch radar
+
+// Watchlist monitor thresholds
+const WATCHLIST_ALERT_COOLDOWN_S = 5 * 60;       // 5-min cooldown per item between alerts
+const WATCHLIST_PRICE_ALERT_PCT = 5;              // ±5% price move triggers alert
+const WATCHLIST_LIQ_DRAIN_PCT = 30;              // ≥30% liquidity drop triggers alert
+const WATCHLIST_RUG_MIN_SELLS = 5;               // minimum sells in 5-min window for rug signal
+const WATCHLIST_RUG_BUY_SELL_RATIO = 0.2;        // buy/sell ratio below this + liq drain = rug signal
+const WATCHLIST_API_DELAY_MS = 400;              // delay between API calls in watchlist monitor
+const ALERT_SEND_DELAY_MS = 200;                 // delay between per-user Telegram sends
 
 // IDs of the background setInterval loops, stored so they can be cleared on shutdown.
 let _launchRadarIntervalId = null;
@@ -2988,7 +2998,7 @@ async function showLaunchRadar(chatId) {
     if (
       pair.liquidityUsd >= LAUNCH_MIN_LIQ_USD &&
       pair.volumeH24 >= LAUNCH_MIN_VOL_USD &&
-      ageMin <= 1440
+      ageMin <= LAUNCH_MAX_AGE_MINUTES
     ) {
       candidates.push(pair);
     }
@@ -3694,7 +3704,7 @@ async function runLaunchRadarAlerts() {
     if (
       pair.liquidityUsd >= LAUNCH_MIN_LIQ_USD &&
       pair.volumeH24 >= LAUNCH_MIN_VOL_USD &&
-      ageMin <= 1440
+      ageMin <= LAUNCH_MAX_AGE_MINUTES
     ) {
       newLaunches.push(pair);
       launchAlertedTokens.set(tokenKey, now);
@@ -3713,7 +3723,6 @@ async function runLaunchRadarAlerts() {
   ];
 
   for (const [i, pair] of newLaunches.entries()) {
-    const ageMin = ageMinutesFromMs(pair.pairCreatedAt);
     const dexUrl = makeDexUrl(pair.chainId, pair.pairAddress, pair.url || "");
     lines.push(
       `${i + 1}. <b>${escapeHtml(pair.baseSymbol || shortAddr(pair.baseAddress, 6))}</b> — ${escapeHtml(humanChain(pair.chainId))}` +
@@ -3730,7 +3739,7 @@ async function runLaunchRadarAlerts() {
   for (const row of userRows) {
     if (!row.chat_id) continue;
     await sendText(String(row.chat_id), alertText, alertKeyboard).catch(() => {});
-    await sleep(200);
+    await sleep(ALERT_SEND_DELAY_MS);
   }
 
   console.log(`[launch-radar-alerts] Alerted ${userRows.length} user(s) about ${newLaunches.length} new launch(es)`);
@@ -3746,7 +3755,6 @@ async function runLaunchRadarAlerts() {
  */
 async function runWatchlistMonitor() {
   const nowSec = nowTs();
-  const ALERT_COOLDOWN_S = 5 * 60; // 5-min cooldown per watchlist item between alerts
 
   const items = await all(
     `SELECT w.*
@@ -3762,7 +3770,7 @@ async function runWatchlistMonitor() {
 
   for (const item of items) {
     try {
-      if (nowSec - num(item.last_alert_ts) < ALERT_COOLDOWN_S) {
+      if (nowSec - num(item.last_alert_ts) < WATCHLIST_ALERT_COOLDOWN_S) {
         // Still in cooldown — refresh price silently
         const pair = await resolveTokenToBestPair(item.chain_id, item.token_address, true).catch(() => null);
         if (pair) {
@@ -3774,7 +3782,7 @@ async function runWatchlistMonitor() {
         continue;
       }
 
-      await sleep(400);
+      await sleep(WATCHLIST_API_DELAY_MS);
 
       const pair = await resolveTokenToBestPair(item.chain_id, item.token_address, true).catch(() => null);
       if (!pair) continue;
@@ -3792,8 +3800,8 @@ async function runWatchlistMonitor() {
 
       // Rug pull composite signal: liquidity drain + extreme sell pressure
       const liqDropPct = storedLiq > 0 ? ((storedLiq - currentLiq) / storedLiq) * 100 : 0;
-      const isLiqDrain = liqDropPct >= 30;
-      const isExtremeSellPressure = recentSells >= 5 && recentBuys < recentSells * 0.2;
+      const isLiqDrain = liqDropPct >= WATCHLIST_LIQ_DRAIN_PCT;
+      const isExtremeSellPressure = recentSells >= WATCHLIST_RUG_MIN_SELLS && recentBuys < recentSells * WATCHLIST_RUG_BUY_SELL_RATIO;
       const isRugSignal = isLiqDrain && isExtremeSellPressure;
 
       if (isRugSignal) {
@@ -3827,7 +3835,7 @@ async function runWatchlistMonitor() {
         ];
       } else if (storedPrice > 0 && currentPrice > 0) {
         const priceChangePct = ((currentPrice - storedPrice) / storedPrice) * 100;
-        if (Math.abs(priceChangePct) >= 5) {
+        if (Math.abs(priceChangePct) >= WATCHLIST_PRICE_ALERT_PCT) {
           alertType = "price";
           const dir = priceChangePct > 0 ? "📈 UP" : "📉 DOWN";
           const sign = priceChangePct > 0 ? "+" : "";
