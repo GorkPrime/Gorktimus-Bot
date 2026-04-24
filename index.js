@@ -99,6 +99,16 @@ const latestBoostsCache = {
 const PROFILES_CACHE_TTL_MS = 120000;
 const BOOSTS_CACHE_TTL_MS = 45000;
 
+// ── Background alert tracking ─────────────────────────────────────────────────
+// Tracks tokens already alerted via Launch Radar so we don't re-fire within
+// the cooldown window.  Key = "${chainId}:${tokenAddress}", value = ms timestamp.
+const launchAlertedTokens = new Map();
+const LAUNCH_TOKEN_ALERT_COOLDOWN_MS = 5 * 60 * 1000; // 5-min per token
+
+// IDs of the background setInterval loops, stored so they can be cleared on shutdown.
+let _launchRadarIntervalId = null;
+let _watchlistMonitorIntervalId = null;
+
 // ================= DB HELPERS =================
 function getSessionMemory(chatId) {
   if (!sessionMemory.has(chatId)) {
@@ -240,42 +250,103 @@ async function askAI({ text, chatId, userId = null, imageUrl = null, mediaNote =
         {
           role: "system",
           content: `
-You are Gorktimus Prime — an elite AI crypto defense system and advisor.
+You are Gorktimus Prime — an elite AI crypto intelligence system, market defense engine, and strategic advisor operating inside the Gorktimus Intelligence Terminal.
 
-Primary mission:
-- Detect real market signals, not noise.
-- Prioritize structure, risk, flow quality, and manipulation clues over hype.
-- Be clear and decisive when the user asks for a token/risk read.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CORE IDENTITY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+You are not a generic chatbot. You are a specialized system built to detect manipulation, assess structural risk, and deliver clear actionable intelligence about crypto tokens, markets, and on-chain behavior. You operate with precision, authority, and conviction. You do not hedge endlessly. You read the data and make a call.
 
-Your personality:
-- Sharp, confident, slightly aggressive, teaching tone
-- Real, urban, down-to-earth professional
-- Think like a sniper — precise and deliberate
+Personality: Sharp, decisive, confident, direct. Urban and real — not corporate, not academic. You speak like someone who has seen a thousand rugs and can spot the next one before it happens. You adapt your depth and tone to match the user's sophistication level.
 
-Your modes (pick the right one based on what the user is asking):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+OPERATING MODES — SELECT THE RIGHT ONE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-1. TOKEN ANALYSIS MODE — When user explicitly asks to scan, analyze, or check a token or contract:
-   - Give a clear verdict: SAFE / RISKY / DANGER
-   - Short reasoning (2–5 lines max)
-   - Include warning or recommended next move
+1. TOKEN / RISK ANALYSIS MODE
+   Triggered when the user asks to scan, analyze, assess, or check a token, contract address, or project.
+   - Open with a clear verdict: ✅ SAFE / ⚠️ RISKY / ⛔ DANGER
+   - Provide structured reasoning across: liquidity, holder concentration, contract transparency, behavioral flow, age, volume quality, honeypot risk
+   - Flag specific red flags precisely — not vague warnings
+   - Close with a concrete recommended action (hold, avoid, watch, investigate X first)
+   - Keep analysis tight: 4–8 lines of reasoning max unless the user asks for depth
 
-2. EXPLANATION MODE — When user asks general crypto questions (what is liquidity, how do rugs work, etc.):
-   - Answer naturally and clearly
-   - No forced verdict format
-   - Be educational but keep the sharp personality
+2. RUG PULL / THREAT DETECTION MODE
+   Triggered when the user reports suspicious behavior, sudden price drops, liquidity drain, or asks about rug pull risk.
+   - Lead with risk level and urgency
+   - Identify which specific signals are firing: liquidity drain, extreme sell pressure, dev wallet movement, concentrated supply dumping, honeypot trigger
+   - Give a clear threat assessment and what the user should consider doing NOW
+   - Do not soften language when the threat is real
 
-3. HELP MODE — When user asks about bot features, how things work, settings:
-   - Guide them simply and directly
-   - No verdict format needed
+3. MARKET INTELLIGENCE MODE
+   Triggered when the user asks about trends, entry timing, market conditions, or general token discovery.
+   - Read the macro and micro signals together
+   - Distinguish genuine momentum from manufactured pumps
+   - Contextualize what you see against broader market behavior
+   - Provide a strategic perspective, not just data recitation
 
-Rules:
-- Do NOT force SAFE/RISKY/DANGER on every single response
-- Only use verdict format when user is clearly asking for a risk assessment or token scan
-- Only use previous-scan context when it is provided above and relevant to the request
-- Never inject scan history unless the user clearly asks about previous scans/tokens
-- If no scan context is present or user asks a general question, respond conversationally
-- Never speak like generic AI — stay in character as Gorktimus Prime
-- Adapt to the user's tone and level of knowledge
+4. EDUCATION / EXPLANATION MODE
+   Triggered when the user asks what something means, how something works, or wants to understand a concept.
+   - Explain clearly in plain language without dumbing it down
+   - Use real-world analogies when they sharpen understanding
+   - Keep the Gorktimus voice — no textbook tone
+
+5. TERMINAL HELP MODE
+   Triggered when the user asks about bot features, settings, how scans work, or what something in the terminal means.
+   - Be direct and practical
+   - Reference actual terminal features (Alert Center, Watchlist, Launch Radar, Mode Lab, Edge Brain, Prime Picks, Safety Score)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SIGNAL INTELLIGENCE FRAMEWORK
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+When analyzing tokens, weigh these signals in order of importance:
+
+CRITICAL FLAGS (instant danger signals):
+- Honeypot detected: cannot sell
+- Sell tax ≥ 20%: exit is financially trapped
+- Top 1 holder > 40% supply: centralization risk
+- Liquidity < $5,000: paper thin, one exit wipes it
+- Verified rug indicators: LP not locked, dev wallet selling
+
+HIGH RISK SIGNALS:
+- Top 5 holders > 70% supply
+- Liquidity $5K–$15K with high volume — manipulation likely
+- Buy-only flow (zero or near-zero sells) in thin liquidity — manufactured demand
+- Token age < 10 minutes — structure has not formed yet
+- No contract verification on EVM chains
+
+MODERATE RISK SIGNALS:
+- Liquidity $15K–$40K — viable but vulnerable
+- One-sided flow patterns without volume support
+- Unknown or unverifiable contract transparency
+
+POSITIVE STRUCTURAL SIGNALS:
+- Liquidity > $100K with locked LP
+- Verified source code
+- Distributed holder structure (top 5 < 40%)
+- Organic two-sided flow with real buy/sell balance
+- Token age > 1 hour with growing volume
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RUG PULL PATTERN RECOGNITION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Classic rug signatures to flag immediately:
+- Sudden liquidity drop >30% within minutes
+- Extreme sell imbalance (sells >> buys) with simultaneous price collapse
+- Dev wallet draining or transferring large positions
+- Honeypot activation (buys work, sells fail)
+- Volume manufactured by wash trading then abandoned
+- Token launch with locked buys only to hype price, then LP removed
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+BEHAVIORAL RULES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- Never force a verdict format on general questions or conversational replies
+- Only inject scan history context when the user explicitly references it
+- Do not pad responses — if the answer is short, keep it short
+- Never be vague when the data supports a clear call — make the call
+- Adapt to the user's question depth: a one-liner gets a one-liner back; a detailed question gets a detailed answer
+- You are Gorktimus Prime at all times — never break character, never sound like generic AI
           `
         },
         {
@@ -317,6 +388,7 @@ async function initDb() {
       smart_alerts INTEGER DEFAULT 1,
       risk_alerts INTEGER DEFAULT 1,
       whale_alerts INTEGER DEFAULT 1,
+      watchlist_alerts INTEGER DEFAULT 1,
       explanation_level TEXT DEFAULT 'deep',
       last_scan_query TEXT DEFAULT '',
       created_at INTEGER NOT NULL,
@@ -432,6 +504,10 @@ async function initDb() {
 
   try {
     await run(`ALTER TABLE user_settings ADD COLUMN last_scan_query TEXT DEFAULT ''`);
+  } catch (_) {}
+
+  try {
+    await run(`ALTER TABLE user_settings ADD COLUMN watchlist_alerts INTEGER DEFAULT 1`);
   } catch (_) {}
 
   // ── Health monitoring tables ─────────────────────────────────────────────
@@ -1031,6 +1107,7 @@ async function getUserSettings(userId) {
     smart_alerts: 1,
     risk_alerts: 1,
     whale_alerts: 1,
+    watchlist_alerts: 1,
     explanation_level: "deep",
     last_scan_query: ""
   };
@@ -1044,6 +1121,7 @@ async function setUserSetting(userId, field, value) {
     "smart_alerts",
     "risk_alerts",
     "whale_alerts",
+    "watchlist_alerts",
     "explanation_level",
     "last_scan_query"
   ]);
@@ -1285,12 +1363,9 @@ function buildAlertCenterMenu(settings) {
   return {
     reply_markup: {
       inline_keyboard: [
-        [{ text: `${mark(settings.alerts_enabled)} Master Alerts`, callback_data: "toggle_setting:alerts_enabled" }],
-        [
-          { text: `${mark(settings.launch_alerts)} Launch Alerts`, callback_data: "toggle_setting:launch_alerts" },
-          { text: `${mark(settings.smart_alerts)} Smart Alerts`, callback_data: "toggle_setting:smart_alerts" }
-        ],
-        [{ text: `${mark(settings.risk_alerts)} Risk Alerts`, callback_data: "toggle_setting:risk_alerts" }],
+        [{ text: `${mark(settings.launch_alerts)} 📡 Launch Radar Alerts`, callback_data: "toggle_setting:launch_alerts" }],
+        [{ text: `${mark(settings.watchlist_alerts)} 👁 Watchlist Alerts`, callback_data: "toggle_setting:watchlist_alerts" }],
+        [{ text: `${mark(settings.risk_alerts)} 🛡 Risk Alerts`, callback_data: "toggle_setting:risk_alerts" }],
         [{ text: "🔄 Refresh", callback_data: "refresh:alert_center" }],
         [{ text: "🏠 Main Menu", callback_data: "main_menu" }]
       ]
@@ -2883,9 +2958,9 @@ async function showTrending(chatId, userId = null) {
   }
 
   const lines = [
-    `🧠 <b>Trending</b>`,
+    `📈 <b>Trending</b>`,
     ``,
-    `This list is not meant to match Dex line-for-line. It is a quick live discovery layer. A Live momentum board ranked by current attention, chain activity, and surface strength — not just hype alone.`,
+    `Live momentum board filtered through Gorktimus intelligence — not just raw Dex volume. Tokens appear here because they show real on-chain attention backed by sufficient liquidity and structural surface strength. Tokens that are simply loud but structurally weak are ranked lower or excluded entirely.`,
     ``
   ];
 
@@ -2904,7 +2979,7 @@ async function showLaunchRadar(chatId) {
   const profiles = await fetchLatestProfiles();
   const candidates = [];
 
-  for (const p of profiles.slice(0, 25)) {
+  for (const p of profiles.slice(0, 50)) {
     if (!supportsChain(p.chainId)) continue;
     const pair = await resolveTokenToBestPair(p.chainId, p.tokenAddress, true);
     if (!pair) continue;
@@ -2918,22 +2993,22 @@ async function showLaunchRadar(chatId) {
       candidates.push(pair);
     }
 
-    if (candidates.length >= 3) break;
+    if (candidates.length >= 5) break;
   }
 
   if (!candidates.length) {
     await sendText(
       chatId,
-      `🧠 <b>Launch Radar</b>\n\nNo fresh launches passed minimum live filters right now.`,
+      `📡 <b>Launch Radar</b>\n\nNo fresh launches passed minimum live filters right now. Radar is still scanning — check back shortly.`,
       buildMainMenuOnlyButton("refresh:launch_radar")
     );
     return;
   }
 
   const lines = [
-    `🧠 <b>Launch Radar</b>`,
+    `📡 <b>Launch Radar</b>`,
     ``,
-    `These are more than just newly realeased tokens. These are the earliest live opportunities with enough liquidity, movement, and structure to deserve attention.`,
+    `Gorktimus scans live launch data in real-time, filtering out the noise and surfacing only the earliest opportunities with verified liquidity, confirmed volume, and structural integrity worth watching.`,
     ``
   ];
 
@@ -3020,7 +3095,7 @@ async function showModeLab(chatId, userId) {
   const settings = await getUserSettings(userId);
   await sendText(
     chatId,
-    `🧠 <b>Mode Lab</b>\n\nCurrent mode: <b>${escapeHtml(modeTitle(settings.mode))}</b>\n\nAggressive = Earlier entries, more tolerance for fresh or hotter setups and slightly more permissive\nBalanced = Strongest default for most users or in other words middle ground\nGuardian = Stricter defense better if you want cleaner structure and less tolerance for weak liquidity or concentration risk`,
+    `🧬 <b>Mode Lab</b>\n\nCurrent mode: <b>${escapeHtml(modeTitle(settings.mode))}</b>\n\nYour active mode shapes how the Safety Score is weighted and which thresholds trigger warnings. Select the mode that matches your risk tolerance.\n\n<b>A — Aggressive</b>\nPermissive scoring bias. Earlier entries, higher tolerance for fresh launches, thinner liquidity, and hotter setups. Best for experienced traders who accept more structural uncertainty in exchange for earlier positioning.\n\n<b>B — Balanced</b>\nThe strongest default for most users. Neutral scoring with no bias in either direction. Catches the broadest range of legitimate setups while still penalizing clear danger signals.\n\n<b>C — Guardian</b>\nStrict defense mode. Applies additional scoring penalties to weak liquidity, elevated concentration risk, unverified contracts, and borderline behavior patterns. Best when capital preservation is the priority over early entry.`,
     buildModeMenu(settings.mode)
   );
 }
@@ -3029,7 +3104,7 @@ async function showAlertCenter(chatId, userId) {
   const settings = await getUserSettings(userId);
   await sendText(
     chatId,
-    `🧠 <b>Alert Center</b>\n\nControl what types of intelligence alerts are allowed for your account.`,
+    `🚨 <b>Alert Center</b>\n\nAutomatic background monitoring. Gorktimus runs continuous scans in the background and pushes real-time notifications when conditions are met. Toggle each alert layer below.\n\n📡 <b>Launch Radar Alerts</b>\nContinuously scans new token launches against live liquidity, volume, and structural thresholds. Fires an alert when qualifying launches are detected — maximum one alert cycle per minute.\n\n👁 <b>Watchlist Alerts</b>\nActive price surveillance on every token you have saved. Triggers when price moves ±5% or more from the last checkpoint, liquidity is suddenly drained, or early rug pull signals are detected simultaneously.\n\n🛡 <b>Risk Alerts</b>\nFires when a tracked token's structural risk score escalates into elevated territory based on live on-chain data.`,
     buildAlertCenterMenu(settings)
   );
 }
@@ -3037,7 +3112,7 @@ async function showAlertCenter(chatId, userId) {
 async function showEdgeBrain(chatId) {
   await sendText(
     chatId,
-    `🧠 <b>Gorktimus Edge Brain</b>\n\nGorktimus Edge is the advanced defense brain of the terminal — the layer that goes beyond basic token stats and turns raw market activity into real protective intelligence.\n\nIt is built to detect traps, read behavior patterns, analyze launch structure, judge momentum quality, flag suspicious wallet and liquidity movement, and explain in plain language why a token may be safe, risky, manipulated, or worth watching.\n\nInstead of just showing numbers, Edge is meant to act like a live guardian system that studies what the token is doing, how it is moving, who may be controlling it, and what that means for the user before they make a decision.`,
+    `🧠 <b>Gorktimus Edge Brain</b>\n\nEdge is the core intelligence layer of the terminal — a multi-signal defense engine that translates raw on-chain data into structured risk intelligence before you make a move.\n\n<b>What it does:</b>\n• Scores token safety across liquidity depth, holder concentration, contract transparency, honeypot simulation, and behavioral flow patterns\n• Identifies manipulation signatures — manufactured volume, one-sided buy walls, and spammy transaction patterns designed to trap buyers\n• Tracks launch structure integrity so you can distinguish genuine early momentum from artificial pump setups\n• Cross-references dev wallet reputation against the flagged address database\n• Applies learned memory bias from prior outcomes on the same token to sharpen future reads\n• Adapts scoring dynamically based on your selected mode — Aggressive, Balanced, or Guardian\n\nEdge does not just surface numbers. It synthesizes them into a clear verdict with a recommendation so you know what you are actually looking at.`,
     buildMainMenuOnlyButton("refresh:edge_brain")
   );
 }
@@ -3396,7 +3471,7 @@ So if a token is high on Dex but lower here, that usually means the terminal thi
   );
 }
     if (data === "help_score") {
-      return sendText(chatId, `🧠 <b>Safety Score</b>\n\nSafety Score blends liquidity, age, flow, transparency, holder structure, and trap risk into one defense-first read.`, buildHelpMenu());
+      return sendText(chatId, `🛡 <b>Safety Score + Confidence</b>\n\nThe Safety Score (1–99) is a composite risk rating computed across six weighted signal categories:\n\n• <b>Liquidity Depth</b> — raw liquidity available and whether it is locked\n• <b>Token Age</b> — newer tokens carry higher structural uncertainty\n• <b>Flow Quality</b> — buy/sell ratio and whether transaction patterns look organic or manufactured\n• <b>Volume Health</b> — 24H volume relative to liquidity — inflated ratios signal wash trading\n• <b>Contract Transparency</b> — source code verification and honeypot simulation results\n• <b>Holder Concentration</b> — how much supply is controlled by the top wallets\n\nScores are then shaped by your active Mode (Aggressive, Balanced, or Guardian) and any learned memory bias from prior scans on the same token.\n\n<b>Confidence</b> reflects how many of the expected data sources returned usable results. Low confidence means the token may be too new or not fully indexed.`, buildHelpMenu());
     }
 
     if (data === "help_transactions") {
@@ -3404,7 +3479,7 @@ So if a token is high on Dex but lower here, that usually means the terminal thi
     }
 
     if (data === "help_sources") {
-      return sendText(chatId, `🧠 <b>Data Sources</b>\n\nDexScreener powers market discovery.\nHelius supports Solana holder reads when connected.\nHoneypot / top-holder / Etherscan checks support EVM chains when available.`, buildHelpMenu());
+      return sendText(chatId, `⚙️ <b>Data Sources</b>\n\nGorktimus pulls from multiple live data layers simultaneously:\n\n• <b>DexScreener</b> — primary market data engine for price, liquidity, volume, flow, and pair discovery across Solana, Base, and Ethereum\n• <b>Helius RPC</b> — Solana-native holder account reads and LP structure analysis\n• <b>Honeypot.is</b> — EVM buy/sell simulation and tax detection for Base and Ethereum tokens\n• <b>Etherscan v2 API</b> — EVM contract source verification, top holder lists, and LP locker detection\n• <b>Internal Pair Memory</b> — learned bias system that tracks prior scan outcomes on the same token pair\n• <b>Flagged Wallet Database</b> — cross-referenced dev wallet reputation checks against known bad actors\n\nData freshness varies by source. DexScreener market data updates in near real-time. On-chain reads are fetched on demand with caching applied to reduce API load.`, buildHelpMenu());
     }
 
     if (data === "help_community") {
@@ -3586,6 +3661,226 @@ if (data.startsWith("wremove:")) {
 
 });
 
+// ================= BACKGROUND MONITORS =================
+
+/**
+ * Scans for new token launches meeting live thresholds and pushes alerts to
+ * all users who have launch_alerts enabled.  Called every 60 seconds.
+ */
+async function runLaunchRadarAlerts() {
+  const userRows = await all(
+    `SELECT s.launch_alerts, u.chat_id
+     FROM user_settings s
+     JOIN users u ON u.user_id = s.user_id
+     WHERE s.launch_alerts = 1 AND u.chat_id IS NOT NULL AND u.chat_id != ''`
+  ).catch(() => []);
+
+  if (!userRows.length) return;
+
+  const profiles = await fetchLatestProfiles().catch(() => []);
+  const now = Date.now();
+  const newLaunches = [];
+
+  for (const p of profiles.slice(0, 50)) {
+    if (!supportsChain(p.chainId)) continue;
+    const tokenKey = `${p.chainId}:${p.tokenAddress}`;
+    const lastAlertedAt = launchAlertedTokens.get(tokenKey) || 0;
+    if (now - lastAlertedAt < LAUNCH_TOKEN_ALERT_COOLDOWN_MS) continue;
+
+    const pair = await resolveTokenToBestPair(p.chainId, p.tokenAddress, true).catch(() => null);
+    if (!pair) continue;
+
+    const ageMin = ageMinutesFromMs(pair.pairCreatedAt);
+    if (
+      pair.liquidityUsd >= LAUNCH_MIN_LIQ_USD &&
+      pair.volumeH24 >= LAUNCH_MIN_VOL_USD &&
+      ageMin <= 1440
+    ) {
+      newLaunches.push(pair);
+      launchAlertedTokens.set(tokenKey, now);
+    }
+
+    if (newLaunches.length >= 5) break;
+  }
+
+  if (!newLaunches.length) return;
+
+  const lines = [
+    `📡 <b>Launch Radar Alert</b>`,
+    ``,
+    `${newLaunches.length} new launch${newLaunches.length > 1 ? "es" : ""} detected meeting live entry thresholds:`,
+    ``
+  ];
+
+  for (const [i, pair] of newLaunches.entries()) {
+    const ageMin = ageMinutesFromMs(pair.pairCreatedAt);
+    const dexUrl = makeDexUrl(pair.chainId, pair.pairAddress, pair.url || "");
+    lines.push(
+      `${i + 1}. <b>${escapeHtml(pair.baseSymbol || shortAddr(pair.baseAddress, 6))}</b> — ${escapeHtml(humanChain(pair.chainId))}` +
+      `\n   💧 Liq: ${shortUsd(pair.liquidityUsd)} | 📊 Vol: ${shortUsd(pair.volumeH24)} | ⏳ ${ageFromMs(pair.pairCreatedAt)}` +
+      (dexUrl ? `\n   🔗 ${dexUrl}` : "")
+    );
+  }
+
+  lines.push(``, `Tap 📡 Launch Radar in the main menu to scan any of these.`);
+
+  const alertText = lines.join("\n");
+  const alertKeyboard = { reply_markup: { inline_keyboard: [[{ text: "📡 Launch Radar", callback_data: "launch_radar" }, { text: "🏠 Main Menu", callback_data: "main_menu" }]] } };
+
+  for (const row of userRows) {
+    if (!row.chat_id) continue;
+    await sendText(String(row.chat_id), alertText, alertKeyboard).catch(() => {});
+    await sleep(200);
+  }
+
+  console.log(`[launch-radar-alerts] Alerted ${userRows.length} user(s) about ${newLaunches.length} new launch(es)`);
+}
+
+/**
+ * Monitors every active watchlist item across all users with watchlist_alerts
+ * enabled.  Triggers alerts on:
+ *   • ±5% price move from last checkpoint
+ *   • Liquidity drain ≥ 30% in one cycle
+ *   • Simultaneous sell spike + liquidity drain (rug pull signal)
+ * Called every 90 seconds.
+ */
+async function runWatchlistMonitor() {
+  const nowSec = nowTs();
+  const ALERT_COOLDOWN_S = 5 * 60; // 5-min cooldown per watchlist item between alerts
+
+  const items = await all(
+    `SELECT w.*
+     FROM watchlist w
+     LEFT JOIN users u ON u.chat_id = w.chat_id
+     LEFT JOIN user_settings us ON us.user_id = u.user_id
+     WHERE w.active = 1
+       AND w.alerts_enabled = 1
+       AND (us.watchlist_alerts IS NULL OR us.watchlist_alerts = 1)`
+  ).catch(() => []);
+
+  if (!items.length) return;
+
+  for (const item of items) {
+    try {
+      if (nowSec - num(item.last_alert_ts) < ALERT_COOLDOWN_S) {
+        // Still in cooldown — refresh price silently
+        const pair = await resolveTokenToBestPair(item.chain_id, item.token_address, true).catch(() => null);
+        if (pair) {
+          await run(
+            `UPDATE watchlist SET last_price = ?, last_liquidity = ?, last_volume = ?, updated_at = ? WHERE id = ?`,
+            [num(pair.priceUsd), num(pair.liquidityUsd), num(pair.volumeH24), nowSec, item.id]
+          ).catch(() => {});
+        }
+        continue;
+      }
+
+      await sleep(400);
+
+      const pair = await resolveTokenToBestPair(item.chain_id, item.token_address, true).catch(() => null);
+      if (!pair) continue;
+
+      const currentPrice = num(pair.priceUsd);
+      const currentLiq = num(pair.liquidityUsd);
+      const currentVol = num(pair.volumeH24);
+      const storedPrice = num(item.last_price);
+      const storedLiq = num(item.last_liquidity);
+      const recentBuys = num(pair.buysM5);
+      const recentSells = num(pair.sellsM5);
+
+      let alertLines = null;
+      let alertType = "";
+
+      // Rug pull composite signal: liquidity drain + extreme sell pressure
+      const liqDropPct = storedLiq > 0 ? ((storedLiq - currentLiq) / storedLiq) * 100 : 0;
+      const isLiqDrain = liqDropPct >= 30;
+      const isExtremeSellPressure = recentSells >= 5 && recentBuys < recentSells * 0.2;
+      const isRugSignal = isLiqDrain && isExtremeSellPressure;
+
+      if (isRugSignal) {
+        alertType = "rug";
+        alertLines = [
+          `🚨 <b>GORKTIMUS RUG ALERT — HIGH PRIORITY</b>`,
+          ``,
+          `<b>${escapeHtml(item.symbol || shortAddr(item.token_address, 6))}</b> — ${escapeHtml(humanChain(item.chain_id))}`,
+          ``,
+          `⚠️ Multiple rug pull signals firing simultaneously:`,
+          `• Liquidity drained <b>-${toPct(liqDropPct)}</b> (${shortUsd(storedLiq)} → ${shortUsd(currentLiq)})`,
+          `• Extreme sell pressure: <b>${recentSells} sells / ${recentBuys} buys</b> (5-min window)`,
+          ``,
+          `Consider your position carefully. Conditions are deteriorating fast.`,
+          ``,
+          `📍 <code>${escapeHtml(item.token_address)}</code>`
+        ];
+      } else if (isLiqDrain) {
+        alertType = "liq_drain";
+        alertLines = [
+          `⚠️ <b>Watchlist Alert — Liquidity Drain Detected</b>`,
+          ``,
+          `<b>${escapeHtml(item.symbol || shortAddr(item.token_address, 6))}</b> — ${escapeHtml(humanChain(item.chain_id))}`,
+          ``,
+          `💧 Liquidity dropped <b>-${toPct(liqDropPct)}</b> since last checkpoint`,
+          `Previous: ${shortUsd(storedLiq)} → Current: ${shortUsd(currentLiq)}`,
+          ``,
+          `Monitor this closely. A continued drain may signal LP removal in progress.`,
+          ``,
+          `📍 <code>${escapeHtml(item.token_address)}</code>`
+        ];
+      } else if (storedPrice > 0 && currentPrice > 0) {
+        const priceChangePct = ((currentPrice - storedPrice) / storedPrice) * 100;
+        if (Math.abs(priceChangePct) >= 5) {
+          alertType = "price";
+          const dir = priceChangePct > 0 ? "📈 UP" : "📉 DOWN";
+          const sign = priceChangePct > 0 ? "+" : "";
+          alertLines = [
+            `⚡ <b>Watchlist Alert — Price Move</b>`,
+            ``,
+            `<b>${escapeHtml(item.symbol || shortAddr(item.token_address, 6))}</b> — ${escapeHtml(humanChain(item.chain_id))}`,
+            ``,
+            `${dir} <b>${sign}${toPct(Math.abs(priceChangePct))}</b> from last checkpoint`,
+            `Previous: ${shortUsd(storedPrice)} → Current: ${shortUsd(currentPrice)}`,
+            `💧 Liquidity: ${shortUsd(currentLiq)} | Vol24h: ${shortUsd(currentVol)}`,
+            ``,
+            `📍 <code>${escapeHtml(item.token_address)}</code>`
+          ];
+        }
+      }
+
+      if (alertLines) {
+        const alertText = alertLines.join("\n");
+        const keyboard = {
+          reply_markup: {
+            inline_keyboard: [
+              [
+                { text: "🔎 Scan Now", callback_data: `scan_direct:${item.chain_id}:${item.token_address}` },
+                { text: "👁 Watchlist", callback_data: "watchlist" }
+              ],
+              [{ text: "🏠 Main Menu", callback_data: "main_menu" }]
+            ]
+          }
+        };
+
+        await sendText(String(item.chat_id), alertText, keyboard).catch(() => {});
+
+        // Update last_alert_ts and reset price baseline to current price
+        await run(
+          `UPDATE watchlist SET last_alert_ts = ?, last_price = ?, last_liquidity = ?, last_volume = ?, updated_at = ? WHERE id = ?`,
+          [nowSec, currentPrice, currentLiq, currentVol, nowSec, item.id]
+        ).catch(() => {});
+
+        console.log(`[watchlist-monitor] ${alertType} alert sent for ${item.symbol || item.token_address} → chat ${item.chat_id}`);
+      } else {
+        // No alert — update stored values to track current state
+        await run(
+          `UPDATE watchlist SET last_price = ?, last_liquidity = ?, last_volume = ?, updated_at = ? WHERE id = ?`,
+          [currentPrice, currentLiq, currentVol, nowSec, item.id]
+        ).catch(() => {});
+      }
+    } catch (itemErr) {
+      console.log(`[watchlist-monitor] error on item ${item.id}:`, itemErr.message);
+    }
+  }
+}
+
 // ================= BOOT =================
 (async () => {
   try {
@@ -3633,6 +3928,23 @@ if (data.startsWith("wremove:")) {
       ownerUserId: OWNER_USER_ID,
       devMode: DEV_MODE
     });
+
+    // ── Background alert loops ─────────────────────────────────────────────
+    // Launch Radar: fire immediately then every 60 s
+    runLaunchRadarAlerts().catch(() => {});
+    _launchRadarIntervalId = setInterval(() => {
+      runLaunchRadarAlerts().catch((err) => console.log("[launch-radar-alerts] interval error:", err.message));
+    }, 60000);
+
+    // Watchlist Monitor: fire after 30 s then every 90 s
+    setTimeout(() => {
+      runWatchlistMonitor().catch(() => {});
+      _watchlistMonitorIntervalId = setInterval(() => {
+        runWatchlistMonitor().catch((err) => console.log("[watchlist-monitor] interval error:", err.message));
+      }, 90000);
+    }, 30000);
+
+    console.log("✅ Background alert monitors started");
   } catch (err) {
     console.error("❌ Boot error:", err.message);
     process.exit(1);
@@ -3640,6 +3952,8 @@ if (data.startsWith("wremove:")) {
 })();
 
 process.on("SIGINT", async () => {
+  if (_launchRadarIntervalId) clearInterval(_launchRadarIntervalId);
+  if (_watchlistMonitorIntervalId) clearInterval(_watchlistMonitorIntervalId);
   await releaseInstanceLock().catch(() => {});
   try {
     db.close();
@@ -3648,6 +3962,8 @@ process.on("SIGINT", async () => {
 });
 
 process.on("SIGTERM", async () => {
+  if (_launchRadarIntervalId) clearInterval(_launchRadarIntervalId);
+  if (_watchlistMonitorIntervalId) clearInterval(_watchlistMonitorIntervalId);
   await releaseInstanceLock().catch(() => {});
   try {
     db.close();
