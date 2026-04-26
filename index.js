@@ -4135,23 +4135,12 @@ async function runMoversAlert() {
       process.once("beforeExit", releaseInstanceLock);
     }
 
-    // ── Graceful polling-error handler (409 Conflict) ──────────────────────
-    bot.on("polling_error", (err) => {
-      const msg = String(err?.message || "");
-      if (msg.includes("409") || msg.includes("Conflict")) {
-        console.warn(`[polling_error] 409 Conflict detected — another instance may be running. Stopping polling.`);
-        try { bot.stopPolling(); } catch (_) {}
-      } else {
-        console.error(`[polling_error] ${JSON.stringify({ code: err?.code, message: msg })}`);
-      }
-    });
-
     const me = await bot.getMe();
     BOT_USERNAME = me?.username || "";
     console.log(`✅ Gorktimus online as @${BOT_USERNAME || "unknown_bot"}`);
 
     // Start health monitoring after DB is ready
-    initHealthMonitor({
+    const healthMonitor = initHealthMonitor({
       bot,
       run,
       get,
@@ -4161,26 +4150,77 @@ async function runMoversAlert() {
       devMode: DEV_MODE
     });
 
+    // ── Graceful polling-error handler ──────────────────────────────────────
+    // Throttle owner alerts to at most once per 5 minutes to avoid spam.
+    let _lastPollingAlertTs = 0;
+    const POLLING_ALERT_COOLDOWN_MS = 5 * 60 * 1000;
+
+    bot.on("polling_error", async (err) => {
+      const msg = String(err?.message || "");
+      const is409 = msg.includes("409") || msg.includes("Conflict");
+
+      if (is409) {
+        console.warn(`[polling_error] 409 Conflict detected — another instance may be running. Stopping polling.`);
+        try { bot.stopPolling(); } catch (_) {}
+
+        // Restart polling after 30 s once the conflicting instance clears.
+        if (ENABLE_POLLING) {
+          setTimeout(async () => {
+            try {
+              await forceAcquireInstanceLock();
+            } catch (lockErr) {
+              console.error("[polling_error] Failed to acquire instance lock before restart:", lockErr.message);
+            }
+            try {
+              await bot.startPolling({ restart: false });
+              console.log("[polling_error] Polling restarted after 409 conflict resolution");
+            } catch (restartErr) {
+              console.error("[polling_error] Failed to restart polling:", restartErr.message);
+            }
+          }, 30000);
+        }
+      } else {
+        console.error(`[polling_error] ${JSON.stringify({ code: err?.code, message: msg })}`);
+      }
+
+      // Log every polling error to the health monitor for audit visibility.
+      await healthMonitor?.logError(`polling_error: ${msg}`, err?.stack || "", "critical").catch((hmErr) => {
+        console.error("[polling_error] Failed to log error to health monitor:", hmErr.message);
+      });
+
+      // Alert the owner (throttled) so transient issues surface immediately.
+      const now = Date.now();
+      if (OWNER_USER_ID && now - _lastPollingAlertTs > POLLING_ALERT_COOLDOWN_MS) {
+        _lastPollingAlertTs = now;
+        const alertText = is409
+          ? `⚠️ <b>Polling Error (409 Conflict)</b>\n\nAnother bot instance was detected. Polling stopped and restart scheduled in 30s.\n\n<code>${msg.slice(0, 200)}</code>`
+          : `⚠️ <b>Polling Error</b>\n\nCode: <code>${err?.code || "unknown"}</code>\nMessage: <code>${msg.slice(0, 200)}</code>`;
+        bot.sendMessage(OWNER_USER_ID, alertText, { parse_mode: "HTML" }).catch((sendErr) => {
+          console.error("[polling_error] Failed to send owner alert:", sendErr.message);
+        });
+      }
+    });
+
     // ── Background alert loops ─────────────────────────────────────────────
     // Launch Radar: fire immediately then every 60 s
-    runLaunchRadarAlerts().catch(() => {});
+    runLaunchRadarAlerts().catch((err) => console.error("[launch-radar-alerts] initial run error:", err.message));
     _launchRadarIntervalId = setInterval(() => {
-      runLaunchRadarAlerts().catch((err) => console.log("[launch-radar-alerts] interval error:", err.message));
+      runLaunchRadarAlerts().catch((err) => console.error("[launch-radar-alerts] interval error:", err.message));
     }, 60000);
 
     // Watchlist Monitor: fire after 30 s then every 90 s
     setTimeout(() => {
-      runWatchlistMonitor().catch(() => {});
+      runWatchlistMonitor().catch((err) => console.error("[watchlist-monitor] initial run error:", err.message));
       _watchlistMonitorIntervalId = setInterval(() => {
-        runWatchlistMonitor().catch((err) => console.log("[watchlist-monitor] interval error:", err.message));
+        runWatchlistMonitor().catch((err) => console.error("[watchlist-monitor] interval error:", err.message));
       }, 90000);
     }, 30000);
 
     // Movers Alert: fire after 60 s then every 120 s
     setTimeout(() => {
-      runMoversAlert().catch(() => {});
+      runMoversAlert().catch((err) => console.error("[movers-alert] initial run error:", err.message));
       _moversAlertIntervalId = setInterval(() => {
-        runMoversAlert().catch((err) => console.log("[movers-alert] interval error:", err.message));
+        runMoversAlert().catch((err) => console.error("[movers-alert] interval error:", err.message));
       }, 120000);
     }, 60000);
 
