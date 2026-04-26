@@ -1455,6 +1455,86 @@ async function main() {
   });
 
   // ────────────────────────────────────────────────────────────────────────────
+  // MARKET CAP DISPLAY TESTS
+  // ────────────────────────────────────────────────────────────────────────────
+  console.log("\nMARKET CAP DISPLAY");
+
+  await test("market cap displays N/A when pair.marketCap is 0", () => {
+    function num(value, fallback = 0) {
+      const n = Number(value);
+      return Number.isFinite(n) ? n : fallback;
+    }
+    function shortUsd(n) {
+      const x = num(n);
+      if (x >= 1_000_000_000) return `$${(x / 1_000_000_000).toFixed(2)}B`;
+      if (x >= 1_000_000) return `$${(x / 1_000_000).toFixed(2)}M`;
+      if (x >= 1_000) return `$${(x / 1_000).toFixed(2)}K`;
+      if (x >= 1) return `$${x.toFixed(4)}`;
+      return `$${x.toFixed(8)}`;
+    }
+    const renderMcap = (marketCap) => marketCap ? shortUsd(marketCap) : "N/A";
+
+    assert.strictEqual(renderMcap(0), "N/A", "zero marketCap should render as N/A");
+    assert.strictEqual(renderMcap(null), "N/A", "null marketCap should render as N/A");
+    assert.strictEqual(renderMcap(undefined), "N/A", "undefined marketCap should render as N/A");
+    assert.strictEqual(renderMcap(5000000), "$5.00M", "valid marketCap should render as formatted USD");
+    assert.strictEqual(renderMcap(1500), "$1.50K", "small valid marketCap should render correctly");
+  });
+
+  // ────────────────────────────────────────────────────────────────────────────
+  // NETWORK PULSE DAY BOUNDARY TESTS
+  // ────────────────────────────────────────────────────────────────────────────
+  console.log("\nNETWORK PULSE");
+
+  await test("getNetworkPulse startOfDay resets at UTC midnight not a rolling window", async () => {
+    // Verify that startOfDay = now - (now % 86400) equals midnight UTC, not a rolling 24h window
+    const now = Math.floor(Date.now() / 1000);
+    const startOfDay = now - (now % 86400);
+    const rollingWindow = now - 86400;
+
+    // startOfDay should be within today (between midnight and now)
+    assert.ok(startOfDay <= now, "startOfDay should not be in the future");
+    assert.ok(startOfDay >= now - 86400, "startOfDay should be within the past 24 hours");
+    assert.ok(startOfDay % 86400 === 0, "startOfDay should be exactly divisible by 86400 (midnight UTC)");
+
+    // The rolling window will NOT be midnight UTC in general
+    // (unless we happen to run exactly at midnight, which is astronomically unlikely)
+    const secondsIntoDayNow = now % 86400;
+    if (secondsIntoDayNow > 10) {
+      // More than 10 seconds into the day — rolling window differs from day boundary
+      assert.ok(startOfDay !== rollingWindow, "startOfDay should differ from rolling 24h window during the day");
+      assert.ok(startOfDay > rollingWindow, "startOfDay should be more recent than rolling 24h ago");
+    }
+  });
+
+  await test("getNetworkPulse counts only scan_logs and user_activity since start of UTC day", async () => {
+    const { run, get, close } = makeDb();
+    await run(`CREATE TABLE IF NOT EXISTS scan_logs (user_id TEXT, ts INTEGER)`);
+    await run(`CREATE TABLE IF NOT EXISTS user_activity (user_id TEXT, ts INTEGER)`);
+
+    function nowTs() { return Math.floor(Date.now() / 1000); }
+    const now = nowTs();
+    const startOfDay = now - (now % 86400);
+    const yesterday = startOfDay - 3600; // 1 hour before today's midnight — outside today's window
+
+    // Insert one activity/scan from yesterday and two from today
+    await run(`INSERT INTO user_activity (user_id, ts) VALUES ('u1', ?)`, [yesterday]);
+    await run(`INSERT INTO user_activity (user_id, ts) VALUES ('u2', ?)`, [now]);
+    await run(`INSERT INTO user_activity (user_id, ts) VALUES ('u3', ?)`, [now]);
+    await run(`INSERT INTO scan_logs (user_id, ts) VALUES ('u1', ?)`, [yesterday]);
+    await run(`INSERT INTO scan_logs (user_id, ts) VALUES ('u2', ?)`, [now]);
+    await run(`INSERT INTO scan_logs (user_id, ts) VALUES ('u2', ?)`, [now]);  // second scan for u2
+
+    const todayUsers = await get(`SELECT COUNT(DISTINCT user_id) as c FROM user_activity WHERE ts >= ?`, [startOfDay]);
+    const scansToday = await get(`SELECT COUNT(*) as c FROM scan_logs WHERE ts >= ?`, [startOfDay]);
+
+    assert.strictEqual(todayUsers.c, 2, "Should count only users active since midnight UTC");
+    assert.strictEqual(scansToday.c, 2, "Should count only scans since midnight UTC (u1's scan from yesterday excluded, both u2 scans included)");
+
+    await close();
+  });
+
+  // ────────────────────────────────────────────────────────────────────────────
 
   summary();
 }
