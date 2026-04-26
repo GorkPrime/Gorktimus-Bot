@@ -3766,7 +3766,7 @@ async function runLaunchRadarAlerts() {
     const flowLabel = pair.buysM5 > pair.sellsM5 ? "🟢" : "🔴";
     lines.push(
       `${i + 1}. <b>${escapeHtml(pair.baseSymbol || shortAddr(pair.baseAddress, 6))}</b> — ${escapeHtml(humanChain(pair.chainId))}` +
-      `\n   💧 Liq: ${shortUsd(pair.liquidityUsd)} | 📊 Vol: ${shortUsd(pair.volumeH24)} | ⏳ ${ageFromMs(pair.pairCreatedAt)}` +
+      `\n   💰 Mcap: ${shortUsd(pair.marketCap)} | 💧 Liq: ${shortUsd(pair.liquidityUsd)} | 📊 Vol: ${shortUsd(pair.volumeH24)} | ⏳ ${ageFromMs(pair.pairCreatedAt)}` +
       `\n   ${flowLabel} Flow: ${pair.buysM5}B / ${pair.sellsM5}S` +
       (dexUrl ? `\n   🔗 ${dexUrl}` : "")
     );
