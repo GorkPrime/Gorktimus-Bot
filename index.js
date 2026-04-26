@@ -1181,7 +1181,7 @@ async function trackScan(userId) {
 
 async function getNetworkPulse() {
   const now = nowTs();
-  const startOfDay = now - 86400;
+  const startOfDay = now - (now % 86400);
   const liveWindow = now - 900;
 
   const todayUsers = await get(
@@ -1521,7 +1521,7 @@ function buildMiniSignalCard(pair, index, mode = "standard") {
     `━━━━━━━━━━━━━━━`,
     `<b>${index}. <a href="${dexUrl}">${symbol}</a></b> • ${chain}`,
     `<code>${shortAddr(address, 6)}</code>`,
-    `Price: <b>${shortUsd(pair.priceUsd)}</b>   Mcap: <b>${shortUsd(pair.marketCap)}</b>`,
+    `Price: <b>${shortUsd(pair.priceUsd)}</b>   Mcap: <b>${pair.marketCap ? shortUsd(pair.marketCap) : "N/A"}</b>`,
     `Liq: <b>${shortUsd(pair.liquidityUsd)}</b>   Vol: <b>${shortUsd(pair.volumeH24)}</b>`,
     `Flow: <b>${pair.buysM5}B / ${pair.sellsM5}S</b>   Age: <b>${age}</b>`,
     `<i>${escapeHtml(verdict)}</i>`
@@ -3766,7 +3766,7 @@ async function runLaunchRadarAlerts() {
     const flowLabel = pair.buysM5 > pair.sellsM5 ? "🟢" : "🔴";
     lines.push(
       `${i + 1}. <b>${escapeHtml(pair.baseSymbol || shortAddr(pair.baseAddress, 6))}</b> — ${escapeHtml(humanChain(pair.chainId))}` +
-      `\n   💰 Mcap: ${shortUsd(pair.marketCap)} | 💧 Liq: ${shortUsd(pair.liquidityUsd)} | 📊 Vol: ${shortUsd(pair.volumeH24)} | ⏳ ${ageFromMs(pair.pairCreatedAt)}` +
+      `\n   💰 Mcap: ${pair.marketCap ? shortUsd(pair.marketCap) : "N/A"} | 💧 Liq: ${shortUsd(pair.liquidityUsd)} | 📊 Vol: ${shortUsd(pair.volumeH24)} | ⏳ ${ageFromMs(pair.pairCreatedAt)}` +
       `\n   ${flowLabel} Flow: ${pair.buysM5}B / ${pair.sellsM5}S` +
       (dexUrl ? `\n   🔗 ${dexUrl}` : "")
     );
@@ -4062,7 +4062,7 @@ async function runMoversAlert() {
       ``,
       `📈 <b>Price Change:</b> ${h1 >= MOVERS_PRICE_CHANGE_H1_PCT ? `+${toPct(h1)} (1h)` : `+${toPct(m5)} (5m)`}`,
       `💵 <b>Current Rate:</b> ${shortUsd(pair.priceUsd)}`,
-      `📊 <b>Market Cap:</b> ${shortUsd(pair.marketCap)}`,
+      `📊 <b>Market Cap:</b> ${pair.marketCap ? shortUsd(pair.marketCap) : "N/A"}`,
       `💧 <b>Liquidity:</b> ${shortUsd(pair.liquidityUsd)}`,
       `⚡ <b>Buy Pressure:</b> ${buyPressureLabel}`,
       `🛡 <b>Rug Risk:</b> ${rugRisk}`,
