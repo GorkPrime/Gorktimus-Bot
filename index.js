@@ -43,7 +43,7 @@ const TERMINAL_IMG = path.join(__dirname, "assets", "gorktimus_terminal.png");
 const OWNER_USER_ID = process.env.OWNER_USER_ID || "";
 const DEV_MODE = process.env.DEV_MODE === "true" && !!OWNER_USER_ID;
 const ENABLE_POLLING = process.env.ENABLE_POLLING !== "false";
-const INSTANCE_LOCK_TTL_MINUTES = Math.max(1, parseInt(process.env.INSTANCE_LOCK_TTL_MINUTES || "720", 10));
+const INSTANCE_LOCK_TTL_MINUTES = Math.max(1, parseInt(process.env.INSTANCE_LOCK_TTL_MINUTES || "5", 10));
 
 if (!BOT_TOKEN) {
   console.error("❌ TELEGRAM_BOT_TOKEN not set");
@@ -796,6 +796,17 @@ async function acquireInstanceLock() {
 async function releaseInstanceLock() {
   try {
     await run(`DELETE FROM instance_lock WHERE id = 1`);
+  } catch (_) {}
+}
+
+async function forceAcquireInstanceLock() {
+  const now = nowTs();
+  const expiresAt = now + INSTANCE_LOCK_TTL_MINUTES * 60;
+  try {
+    await run(
+      `INSERT OR REPLACE INTO instance_lock (id, locked_at, expires_at) VALUES (1, ?, ?)`,
+      [now, expiresAt]
+    );
   } catch (_) {}
 }
 
@@ -4102,15 +4113,22 @@ async function runMoversAlert() {
 
     // ── Instance lock check (prevents 409 Conflict from multiple bots) ─────
     if (ENABLE_POLLING) {
-      const lockAcquired = await acquireInstanceLock();
+      let lockAcquired = await acquireInstanceLock();
       if (!lockAcquired) {
+        // Old instance may still be shutting down — wait briefly and retry.
         console.warn(
-          `[instance-lock] Another bot instance holds the lock (TTL ${INSTANCE_LOCK_TTL_MINUTES}m). ` +
-          `Set ENABLE_POLLING=false to disable polling on this instance, or wait for the lock to expire.`
+          `[instance-lock] Another bot instance holds the lock. Waiting 20 s for it to release before retrying…`
         );
-        // Don't exit — allow the process to continue without polling (e.g. for webhooks).
-        // The bot object was already created with polling:true above, so we need to stop it.
-        try { bot.stopPolling(); } catch (_) {}
+        await sleep(20000);
+        lockAcquired = await acquireInstanceLock();
+      }
+      if (!lockAcquired) {
+        // Still blocked — assume the previous instance crashed without releasing
+        // the lock. Force-acquire so this deployment is always fully operational.
+        console.warn(
+          `[instance-lock] Lock still held after retry — forcing acquisition (stale lock assumed).`
+        );
+        await forceAcquireInstanceLock();
       }
 
       // Release the lock when the process exits
