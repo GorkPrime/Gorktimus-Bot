@@ -2355,7 +2355,7 @@ function buildShareText(pair, verdict, dexUrl = "") {
   const riskLabel = getGorktimusRiskLabel(verdict.score, { isHoneypot });
   const action = getGorktimusAction(verdict.score, { isHoneypot });
   const call = buildGorktimusCall(pair, verdict);
-  const symbol = String(pair.baseSymbol || "TOKEN").toUpperCase().replace(/[^A-Z0-9]/g, "");
+  const symbol = (String(pair.baseSymbol || "TOKEN").toUpperCase().replace(/[^A-Z0-9]/g, "") || "TOKEN");
   const chain = humanChain(pair.chainId);
   const lines = [
     `⚡ GORKTIMUS SIGNAL`,
@@ -2375,7 +2375,7 @@ function buildShareText(pair, verdict, dexUrl = "") {
 }
 
 function buildXIntentUrl(shareText) {
-  return `https://twitter.com/intent/tweet?text=${encodeURIComponent(shareText)}`;
+  return `https://x.com/intent/tweet?text=${encodeURIComponent(shareText)}`;
 }
 
 async function buildRiskVerdict(pair, userId = null) {
@@ -3502,7 +3502,7 @@ bot.onText(/\/start(.*)/, async (msg, match) => {
     await ensureUserSettings(msg.from.id);
     await trackUserActivity(msg.from.id);
 
-    // Parse referral parameter from deep link (?start=ref_USERID)
+    // Parse referral parameter from deep link (t.me/bot?start=ref_USERID sends bot '/start ref_USERID')
     const param = String(match?.[1] || "").trim();
     if (param.startsWith("ref_")) {
       const referrerId = param.slice(4).trim();
