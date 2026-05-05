@@ -1200,6 +1200,239 @@ async function main() {
   });
 
   // ────────────────────────────────────────────────────────────────────────────
+  // FREEZE AUTHORITY CHECKS
+  // ────────────────────────────────────────────────────────────────────────────
+  console.log("\nFREEZE AUTHORITY CHECKS");
+
+  // Self-contained replica of fetchSolanaFreezableStatus with injectable deps
+  function makeFetchSolanaFreezableStatus({ mockAxios, hasHelius = true, heliusRpcUrl = "https://rpc.test" }) {
+    async function fetchSolanaFreezableStatus(mintAddress) {
+      if (!mintAddress || !hasHelius) return { freezable: null, label: "🧊 ❓ Unknown" };
+      try {
+        const res = await mockAxios.post(
+          heliusRpcUrl,
+          { jsonrpc: "2.0", id: "mint-freeze-check", method: "getAccountInfo", params: [mintAddress, { encoding: "base64" }] },
+          { timeout: 5000 }
+        );
+        const value = res.data?.result?.value;
+        if (!value) return { freezable: null, label: "🧊 ❓ Unknown" };
+        const dataArr = Array.isArray(value.data) ? value.data : [];
+        const dataBase64 = dataArr[0] || "";
+        if (!dataBase64) return { freezable: null, label: "🧊 ❓ Unknown" };
+        const buf = Buffer.from(dataBase64, "base64");
+        if (buf.length < 50) return { freezable: null, label: "🧊 ❓ Unknown" };
+        const freezeAuthOption = buf.readUInt32LE(46);
+        const freezable = freezeAuthOption === 1;
+        return {
+          freezable,
+          label: freezable ? "🧊 ⚠️ Freezable Mint" : "🧊 ✅ Freeze Revoked"
+        };
+      } catch (_) {
+        return { freezable: null, label: "🧊 ❓ Unknown" };
+      }
+    }
+    return { fetchSolanaFreezableStatus };
+  }
+
+  // Helper: build a minimal SPL Token mint account buffer (82 bytes)
+  // with the freeze_authority_option field at bytes 46-49 (uint32 LE)
+  function makeMintAccountBase64(freezeAuthOption) {
+    const buf = Buffer.alloc(82, 0);
+    buf.writeUInt32LE(freezeAuthOption, 46);
+    return buf.toString("base64");
+  }
+
+  await test("Solana freeze: returns freezable=true when freeze_authority_option is 1", async () => {
+    const mintBase64 = makeMintAccountBase64(1);
+    const mockAxios = {
+      post: async () => ({ data: { result: { value: { data: [mintBase64, "base64"] } } } })
+    };
+    const { fetchSolanaFreezableStatus } = makeFetchSolanaFreezableStatus({ mockAxios });
+    const r = await fetchSolanaFreezableStatus("MintAddr111111111111111111111111111111111111");
+    assert.strictEqual(r.freezable, true);
+    assert.ok(r.label.includes("⚠️"), "label should contain ⚠️ for active freeze authority");
+  });
+
+  await test("Solana freeze: returns freezable=false when freeze_authority_option is 0", async () => {
+    const mintBase64 = makeMintAccountBase64(0);
+    const mockAxios = {
+      post: async () => ({ data: { result: { value: { data: [mintBase64, "base64"] } } } })
+    };
+    const { fetchSolanaFreezableStatus } = makeFetchSolanaFreezableStatus({ mockAxios });
+    const r = await fetchSolanaFreezableStatus("MintAddr111111111111111111111111111111111111");
+    assert.strictEqual(r.freezable, false);
+    assert.ok(r.label.includes("✅"), "label should contain ✅ when freeze authority revoked");
+  });
+
+  await test("Solana freeze: returns freezable=null when mintAddress is empty", async () => {
+    const { fetchSolanaFreezableStatus } = makeFetchSolanaFreezableStatus({ mockAxios: {} });
+    const r = await fetchSolanaFreezableStatus("");
+    assert.strictEqual(r.freezable, null);
+    assert.ok(r.label.includes("❓"));
+  });
+
+  await test("Solana freeze: returns freezable=null when Helius key is absent", async () => {
+    const { fetchSolanaFreezableStatus } = makeFetchSolanaFreezableStatus({ mockAxios: {}, hasHelius: false });
+    const r = await fetchSolanaFreezableStatus("MintAddr111111111111111111111111111111111111");
+    assert.strictEqual(r.freezable, null, "No Helius key → skip RPC → return unknown");
+  });
+
+  await test("Solana freeze: returns freezable=null when getAccountInfo returns no value", async () => {
+    const mockAxios = {
+      post: async () => ({ data: { result: { value: null } } })
+    };
+    const { fetchSolanaFreezableStatus } = makeFetchSolanaFreezableStatus({ mockAxios });
+    const r = await fetchSolanaFreezableStatus("MintAddr111111111111111111111111111111111111");
+    assert.strictEqual(r.freezable, null);
+  });
+
+  await test("Solana freeze: returns freezable=null when decoded buffer is shorter than 50 bytes", async () => {
+    const shortBuf = Buffer.alloc(30, 0).toString("base64"); // 30 bytes — too short to read offset 46
+    const mockAxios = {
+      post: async () => ({ data: { result: { value: { data: [shortBuf, "base64"] } } } })
+    };
+    const { fetchSolanaFreezableStatus } = makeFetchSolanaFreezableStatus({ mockAxios });
+    const r = await fetchSolanaFreezableStatus("MintAddr111111111111111111111111111111111111");
+    assert.strictEqual(r.freezable, null, "Short buffer should return unknown, not throw");
+  });
+
+  await test("Solana freeze: returns freezable=null on RPC error", async () => {
+    const mockAxios = {
+      post: async () => { throw new Error("network failure"); }
+    };
+    const { fetchSolanaFreezableStatus } = makeFetchSolanaFreezableStatus({ mockAxios });
+    const r = await fetchSolanaFreezableStatus("MintAddr111111111111111111111111111111111111");
+    assert.strictEqual(r.freezable, null, "RPC error should return unknown, not throw");
+  });
+
+  // Self-contained replica of checkEvmFreezableMint (pure function, no external deps)
+  function testCheckEvmFreezableMint(honeypotData, etherscanData) {
+    const flags = Array.isArray(honeypotData?.flags) ? honeypotData.flags : [];
+    const hasBlacklistFlag = flags.some((f) =>
+      /blacklist|freeze|block_transfer/i.test(String(f || ""))
+    );
+    if (hasBlacklistFlag) {
+      return { freezable: true, label: "🧊 ⚠️ Freezable Mint" };
+    }
+    if (etherscanData) {
+      const source = String(etherscanData.SourceCode || "");
+      const abi = String(etherscanData.ABI || "").trim();
+      const verified = abi !== "" && abi !== "Contract source code not verified";
+      if (source && verified) {
+        const hasFreezeCode =
+          /function\s+(freeze|unfreeze|blacklist|setBlacklist|addBlacklist|removeBlacklist|blockAddress|blockWallet)\s*\(/i.test(source) ||
+          /mapping\s*\(\s*address\s*=>\s*bool\s*\)\s*(public|private|internal)\s*(isBlacklisted|blacklisted|frozen|blocked|_blacklist)/i.test(source) ||
+          /isBlacklisted\s*\[|_blacklist\s*\[|_frozen\s*\[|_blocked\s*\[/i.test(source);
+        if (hasFreezeCode) {
+          return { freezable: true, label: "🧊 ⚠️ Freezable Mint" };
+        }
+        return { freezable: false, label: "🧊 ✅ Freeze Revoked" };
+      }
+      if (verified) {
+        return { freezable: null, label: "🧊 ❓ Unknown" };
+      }
+    }
+    return { freezable: null, label: "🧊 ❓ Unknown" };
+  }
+
+  await test("EVM freeze: returns freezable=true when honeypot flags contain BLACKLIST", () => {
+    const r = testCheckEvmFreezableMint({ flags: ["BLACKLIST", "SELL_TAX"] }, null);
+    assert.strictEqual(r.freezable, true);
+    assert.ok(r.label.includes("⚠️"));
+  });
+
+  await test("EVM freeze: returns freezable=true when honeypot flags contain FREEZE", () => {
+    const r = testCheckEvmFreezableMint({ flags: ["FREEZE"] }, null);
+    assert.strictEqual(r.freezable, true);
+  });
+
+  await test("EVM freeze: returns freezable=true when verified source contains a freeze function", () => {
+    const r = testCheckEvmFreezableMint(
+      { flags: [] },
+      { SourceCode: "function freeze(address account) external onlyOwner { ... }", ABI: "[{...}]" }
+    );
+    assert.strictEqual(r.freezable, true);
+  });
+
+  await test("EVM freeze: returns freezable=true when verified source contains a blacklist function", () => {
+    const r = testCheckEvmFreezableMint(
+      { flags: [] },
+      { SourceCode: "function blacklist(address account) external { blocked[account] = true; }", ABI: "[{...}]" }
+    );
+    assert.strictEqual(r.freezable, true);
+  });
+
+  await test("EVM freeze: returns freezable=true when verified source uses isBlacklisted mapping", () => {
+    const r = testCheckEvmFreezableMint(
+      { flags: [] },
+      { SourceCode: "mapping(address => bool) public isBlacklisted;", ABI: "[{...}]" }
+    );
+    assert.strictEqual(r.freezable, true);
+  });
+
+  await test("EVM freeze: returns freezable=true when verified source uses _blacklist lookup", () => {
+    const r = testCheckEvmFreezableMint(
+      { flags: [] },
+      { SourceCode: "require(!_blacklist[msg.sender], 'Blacklisted');", ABI: "[{...}]" }
+    );
+    assert.strictEqual(r.freezable, true);
+  });
+
+  await test("EVM freeze: returns freezable=false when verified source has no freeze or blacklist code", () => {
+    const r = testCheckEvmFreezableMint(
+      { flags: [] },
+      { SourceCode: "function transfer(address to, uint256 amount) external { ... }", ABI: "[{...}]" }
+    );
+    assert.strictEqual(r.freezable, false);
+    assert.ok(r.label.includes("✅"), "label should contain ✅ for clean verified contract");
+  });
+
+  await test("EVM freeze: returns freezable=null when contract source is not verified", () => {
+    const r = testCheckEvmFreezableMint(
+      { flags: [] },
+      { SourceCode: "", ABI: "Contract source code not verified" }
+    );
+    assert.strictEqual(r.freezable, null);
+    assert.ok(r.label.includes("❓"));
+  });
+
+  await test("EVM freeze: returns freezable=null when no honeypot data and no etherscan data", () => {
+    const r = testCheckEvmFreezableMint(null, null);
+    assert.strictEqual(r.freezable, null);
+    assert.ok(r.label.includes("❓"));
+  });
+
+  // ── Freeze score modifier logic ──────────────────────────────────────────────
+  console.log("\nFREEZE SCORE MODIFIERS");
+
+  function applyFreezeModifier(baseScore, freezable) {
+    let score = baseScore;
+    if (freezable === true)  score -= 8;
+    if (freezable === false) score += 3;
+    return Math.max(1, Math.min(99, Math.round(score)));
+  }
+
+  await test("freeze score: active freeze authority applies -8 penalty", () => {
+    assert.strictEqual(applyFreezeModifier(60, true), 52);
+  });
+
+  await test("freeze score: revoked freeze authority applies +3 bonus", () => {
+    assert.strictEqual(applyFreezeModifier(60, false), 63);
+  });
+
+  await test("freeze score: unknown freeze status (null) applies 0 modifier", () => {
+    assert.strictEqual(applyFreezeModifier(60, null), 60);
+  });
+
+  await test("freeze score: is clamped at minimum 1 when penalties push score below 1", () => {
+    assert.strictEqual(applyFreezeModifier(5, true), 1);
+  });
+
+  await test("freeze score: is clamped at maximum 99 when bonus pushes score above 99", () => {
+    assert.strictEqual(applyFreezeModifier(99, false), 99);
+  });
+
+  // ────────────────────────────────────────────────────────────────────────────
   // MOVERS ALERT TESTS
   // ────────────────────────────────────────────────────────────────────────────
   console.log("\nMOVERS ALERT");
