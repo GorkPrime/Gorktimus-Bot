@@ -132,7 +132,7 @@ Confidence reflects how many expected data sources returned usable results:
 
 | Variable | Required | Purpose |
 |----------|----------|---------|
-| `TELEGRAM_BOT_TOKEN` | ✅ | Bot authentication |
+| `TELEGRAM_BOT_TOKEN` | ✅ | Terminal authentication |
 | `HELIUS_API_KEY` | ✅ | Solana RPC (holder reads, freeze authority) |
 | `ETHERSCAN_API_KEY` | ✅ | EVM contract data, LP lock, freeze patterns |
 | `OPENAI_API_KEY` | ✅ | AI Assistant (GPT-4 Turbo) |
@@ -157,7 +157,7 @@ Uses Node's built-in `assert` module and in-memory SQLite. No external services 
 ## Architecture
 
 ```
-index.js              — Main bot, all features, scoring engine, background monitors
+index.js              — Main terminal, all features, scoring engine, background monitors
 health-monitor.js     — System scan, error logging, health metrics
 test.js               — Full test suite (node test.js)
 gorktimus.db          — SQLite database (auto-created on boot)
