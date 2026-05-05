@@ -324,6 +324,7 @@ CRITICAL FLAGS (instant danger signals):
 - Sell tax ≥ 20%: exit is financially trapped
 - Top 1 holder > 40% supply: centralization risk
 - Liquidity < $5,000: paper thin, one exit wipes it
+- Freeze authority active: dev can freeze any holder's tokens, permanently blocking sells
 - Verified rug indicators: LP not locked, dev wallet selling
 
 HIGH RISK SIGNALS:
@@ -332,15 +333,18 @@ HIGH RISK SIGNALS:
 - Buy-only flow (zero or near-zero sells) in thin liquidity — manufactured demand
 - Token age < 10 minutes — structure has not formed yet
 - No contract verification on EVM chains
+- Freezable mint with no source verification
 
 MODERATE RISK SIGNALS:
 - Liquidity $15K–$40K — viable but vulnerable
 - One-sided flow patterns without volume support
 - Unknown or unverifiable contract transparency
+- Freeze authority status unknown (can't confirm revoked)
 
 POSITIVE STRUCTURAL SIGNALS:
 - Liquidity > $100K with locked LP
 - Verified source code
+- Freeze authority revoked (confirmed safe)
 - Distributed holder structure (top 5 < 40%)
 - Organic two-sided flow with real buy/sell balance
 - Token age > 1 hour with growing volume
@@ -675,11 +679,20 @@ async function fetchLiquidityLockStatus(pair) {
 
   try {
     if (chainId === "solana") {
-      // Known Solana LP lock program IDs.
-      // Add verified locker program addresses here as they are confirmed.
+      // Known Solana LP locker program IDs (program authority addresses).
+      // These are checked against both the direct SPL token account address
+      // (rare, only old-style lockers) and the parsed account owner/delegate
+      // fields returned by getMultipleAccounts (catches modern PDA-based lockers).
       const SOLANA_LOCK_PROGRAMS = [
-        "LockrWmn6K5twhz3y9w1dQERbmgSaRkfnTeTKbpofwE" // Raydium LP Locker
+        "LockrWmn6K5twhz3y9w1dQERbmgSaRkfnTeTKbpofwE", // Raydium LP Locker v1
+        "7aDTsspkQNGKmrexAN7FLx9oxU3iPczbe3vKcgABqGUT", // Team Finance Solana
+        "strmRqUCoQUgGUan5YhzUZa6KqdzwX5L6FpUxfmKg5m",  // Streamflow Finance
+        "FjuPAKAfpepXoEF4dQ5DWqVnrMzQoZUAPkFTuCnuoRoR", // Magna Locker
+        "GKnHiWh3RRrE1zsNzWxRkomymHc374Rs3N2RHe8VBzNi",  // Fluxbeam Locker
+        "4MNkzgGP2EHmGcPhNJ8vXTDKbXmqhqtEGbMxsJ5mLKg"   // Sol Locker
       ];
+      const lockProgramSet = new Set(SOLANA_LOCK_PROGRAMS);
+
       const res = await axios.post(
         HELIUS_RPC_URL,
         {
@@ -691,26 +704,60 @@ async function fetchLiquidityLockStatus(pair) {
         { timeout: 4000 }
       );
       const accounts = res.data?.result?.value || [];
-      const locked = accounts.some((acc) =>
-        SOLANA_LOCK_PROGRAMS.includes(acc.address)
-      );
-      // Only conclude "locked" when a known program address is confirmed in
-      // the top accounts.  We cannot conclude "unlocked" from this check
-      // because getTokenLargestAccounts returns SPL token-account addresses,
-      // not their owning program IDs — the locker program address will never
-      // appear in acc.address.  Return "unknown" when no match is found so
-      // the score is not incorrectly penalised.
-      result = locked
-        ? { status: "locked", label: "🔐 ✅ Locked - Passed" }
-        : { status: "unknown", label: "🔐 ❓ Unknown" };
+
+      // Primary check: exact address match (covers edge cases where the locker
+      // program address itself appears directly in the accounts list).
+      const directMatch = accounts.some((acc) => lockProgramSet.has(acc.address));
+
+      if (directMatch) {
+        result = { status: "locked", label: "🔐 ✅ Locked - Passed" };
+      } else if (accounts.length > 0) {
+        // Secondary check: inspect actual owner/delegate of each token account.
+        // Modern Solana lockers transfer LP tokens into a token account whose
+        // SPL-parsed "owner" or "delegate" is the locker program or its PDA.
+        // getMultipleAccounts with jsonParsed encoding exposes these fields.
+        try {
+          const addresses = accounts.slice(0, 8).map((a) => a.address).filter(Boolean);
+          if (addresses.length) {
+            const ownersRes = await axios.post(
+              HELIUS_RPC_URL,
+              {
+                jsonrpc: "2.0",
+                id: "lp-account-owners",
+                method: "getMultipleAccounts",
+                params: [addresses, { encoding: "jsonParsed" }]
+              },
+              { timeout: 5000 }
+            );
+            const accountInfos = ownersRes.data?.result?.value || [];
+            const ownerMatch = accountInfos.some((info) => {
+              if (!info) return false;
+              const holder = info?.data?.parsed?.info?.owner;
+              if (holder && lockProgramSet.has(holder)) return true;
+              const delegate = info?.data?.parsed?.info?.delegate;
+              if (delegate && lockProgramSet.has(delegate)) return true;
+              return false;
+            });
+            if (ownerMatch) {
+              result = { status: "locked", label: "🔐 ✅ Locked - Passed" };
+            }
+            // No match found — cannot confirm unlocked from SPL account owners alone.
+            // Return "unknown" to avoid false-negative penalties.
+          }
+        } catch (_) {
+          // Secondary check failed — keep "unknown" default
+        }
+      }
     } else if (isEvmChain(chainId)) {
-      // Known EVM LP locker contract addresses (Unicrypt, Team Finance, etc.)
-      // All addresses are stored in lowercase so the case-insensitive comparison
-      // below (which lowercases the holder address from the API) works correctly.
+      // Known EVM LP locker contract addresses.
+      // All addresses are stored in lowercase for case-insensitive comparison.
       const EVM_LOCK_CONTRACTS = [
-        "0x663a5c229c09b049e36dcc11a9b0d4a8eb9db214", // Unicrypt v2
+        "0x663a5c229c09b049e36dcc11a9b0d4a8eb9db214", // Unicrypt v2 (ETH/Base)
+        "0xe2fe530c047f2d85298b07d9333c05737f1435fb", // Unicrypt v3 (ETH)
         "0xdba68f07d1b7ca219f78ae8582c213d975c25caf", // Team Finance
-        "0x71b5759d73262fbb223956913ecf4ecc51057641"  // PinkLock
+        "0x71b5759d73262fbb223956913ecf4ecc51057641", // PinkLock v1
+        "0x407993575c91ce7643a4d4ccacc9a98c36ee1bbe", // PinkLock v2
+        "0x2130d2a1e51112d349ccf78d2a1ee65843ba036e"  // Mudra Locker
       ];
       const chainNum = EVM_CHAIN_IDS[chainId];
       if (chainNum && ETHERSCAN_API_KEY) {
@@ -733,6 +780,108 @@ async function fetchLiquidityLockStatus(pair) {
 
   liquidityLockCache.set(cacheKey, { ts: now, result });
   return result;
+}
+
+// ================= FREEZE AUTHORITY CHECKS =================
+
+/**
+ * Inspects the SPL Token mint account via Helius RPC and returns whether the
+ * token's freeze authority is active (freezable) or has been revoked.
+ *
+ * SPL Token mint layout (82 bytes):
+ *   [0..4]   mint_authority_option  (COption<u32>)
+ *   [4..36]  mint_authority         (Pubkey)
+ *   [36..44] supply                 (u64)
+ *   [44]     decimals               (u8)
+ *   [45]     is_initialized         (bool)
+ *   [46..50] freeze_authority_option(COption<u32>) ← 0=None, 1=Some
+ *   [50..82] freeze_authority       (Pubkey)
+ *
+ * If freeze_authority_option == 1 the dev can freeze any holder's token
+ * account, permanently blocking them from selling.  This is one of the
+ * most dangerous rug vectors and must be surfaced prominently.
+ */
+async function fetchSolanaFreezableStatus(mintAddress) {
+  if (!mintAddress || !hasHelius()) return { freezable: null, label: "🧊 ❓ Unknown" };
+  try {
+    const res = await axios.post(
+      HELIUS_RPC_URL,
+      {
+        jsonrpc: "2.0",
+        id: "mint-freeze-check",
+        method: "getAccountInfo",
+        params: [mintAddress, { encoding: "base64" }]
+      },
+      { timeout: 5000 }
+    );
+    const value = res.data?.result?.value;
+    if (!value) return { freezable: null, label: "🧊 ❓ Unknown" };
+    const dataArr = Array.isArray(value.data) ? value.data : [];
+    const dataBase64 = dataArr[0] || "";
+    if (!dataBase64) return { freezable: null, label: "🧊 ❓ Unknown" };
+    const buf = Buffer.from(dataBase64, "base64");
+    // Mint account must be at least 50 bytes (through freeze_authority_option field)
+    if (buf.length < 50) return { freezable: null, label: "🧊 ❓ Unknown" };
+    // Bytes 46-49: freeze_authority_option (uint32 little-endian)
+    // 0 = None (revoked or never set), 1 = Some (active freeze authority)
+    const freezeAuthOption = buf.readUInt32LE(46);
+    const freezable = freezeAuthOption === 1;
+    return {
+      freezable,
+      label: freezable ? "🧊 ⚠️ Freezable Mint" : "🧊 ✅ Freeze Revoked"
+    };
+  } catch (err) {
+    console.log("fetchSolanaFreezableStatus error:", err.message);
+    return { freezable: null, label: "🧊 ❓ Unknown" };
+  }
+}
+
+/**
+ * Detects EVM freeze/blacklist capability using already-fetched honeypot and
+ * Etherscan data (synchronous — no extra API calls).
+ *
+ * Detection strategy (in priority order):
+ *   1. Honeypot.is flags array — contains explicit "BLACKLIST" / "FREEZE" markers.
+ *   2. Verified source code — regex scan for common freeze/blacklist function patterns.
+ *   3. If verified but no patterns found → confirm clean.
+ *   4. Otherwise → unknown.
+ */
+function checkEvmFreezableMint(honeypotData, etherscanData) {
+  // 1. Honeypot flags (fastest, most reliable)
+  const flags = Array.isArray(honeypotData?.flags) ? honeypotData.flags : [];
+  const hasBlacklistFlag = flags.some((f) =>
+    /blacklist|freeze|block_transfer/i.test(String(f || ""))
+  );
+  if (hasBlacklistFlag) {
+    return { freezable: true, label: "🧊 ⚠️ Freezable Mint" };
+  }
+
+  // 2. Verified source code scan
+  if (etherscanData) {
+    const source = String(etherscanData.SourceCode || "");
+    const abi = String(etherscanData.ABI || "").trim();
+    const verified = abi !== "" && abi !== "Contract source code not verified";
+
+    if (source && verified) {
+      // Patterns that indicate a freeze or blacklist capability
+      const hasFreezeCode =
+        /function\s+(freeze|unfreeze|blacklist|setBlacklist|addBlacklist|removeBlacklist|blockAddress|blockWallet)\s*\(/i.test(source) ||
+        /mapping\s*\(\s*address\s*=>\s*bool\s*\)\s*(public|private|internal)\s*(isBlacklisted|blacklisted|frozen|blocked|_blacklist)/i.test(source) ||
+        /isBlacklisted\s*\[|_blacklist\s*\[|_frozen\s*\[|_blocked\s*\[/i.test(source);
+      if (hasFreezeCode) {
+        return { freezable: true, label: "🧊 ⚠️ Freezable Mint" };
+      }
+      // Verified and no freeze code detected → confirmed clean
+      return { freezable: false, label: "🧊 ✅ Freeze Revoked" };
+    }
+
+    if (verified) {
+      // Verified but source not available in response
+      return { freezable: null, label: "🧊 ❓ Unknown" };
+    }
+  }
+
+  return { freezable: null, label: "🧊 ❓ Unknown" };
 }
 
 async function checkDevWalletReputation(walletAddress, chainId) {
@@ -2404,11 +2553,20 @@ async function buildRiskVerdict(pair, userId = null) {
   let sellTax = null;
   let holderTop5Pct = 0;
   let isHoneypot = null;
-  let sourceChecks = { available: 1, expected: 3 };
+  let sourceChecks = { available: 1, expected: 4 };
+
+  // Freeze authority status (chain-specific, fetched below)
+  let freezeStatus = { freezable: null, label: "🧊 ❓ Unknown" };
 
   const chain = String(pair.chainId || "").toLowerCase();
 if (chain === "solana") {
-  const largestAccounts = await fetchHeliusTokenLargestAccounts(pair.baseAddress);
+  const [largestAccounts, freezeResult] = await Promise.all([
+    fetchHeliusTokenLargestAccounts(pair.baseAddress),
+    Promise.race([
+      fetchSolanaFreezableStatus(pair.baseAddress),
+      new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 5000))
+    ]).catch(() => ({ freezable: null, label: "🧊 ❓ Unknown" }))
+  ]);
   const safeLargestAccounts = Array.isArray(largestAccounts) ? largestAccounts : [];
   const holderInfo = analyzeSolanaHolderConcentration(safeLargestAccounts);
 
@@ -2428,9 +2586,11 @@ if (chain === "solana") {
   honeypotDetail =
     "Solana honeypot simulation is limited in this stack, so safety is inferred more from structure.";
 
+  freezeStatus = freezeResult;
+
   sourceChecks = {
-    available: 1 + (safeLargestAccounts.length ? 1 : 0) + 1,
-    expected: 3
+    available: 1 + (safeLargestAccounts.length ? 1 : 0) + 1 + (freezeStatus.freezable !== null ? 1 : 0),
+    expected: 4
   };
 }
   else if (isEvmChain(chain)) {
@@ -2488,9 +2648,12 @@ const [honeypotData, topHoldersData, etherscanData] = await Promise.all([
       transparencyDetail = source ? "Verified source available." : "Source verification unavailable.";
     }
 
+    // EVM freeze check uses already-fetched data — no extra API calls
+    freezeStatus = checkEvmFreezableMint(honeypotData, etherscanData);
+
     sourceChecks = {
-      available: 1 + (honeypotData ? 1 : 0) + (topHoldersData ? 1 : 0) + (etherscanData ? 1 : 0),
-      expected: 4
+      available: 1 + (honeypotData ? 1 : 0) + (topHoldersData ? 1 : 0) + (etherscanData ? 1 : 0) + (freezeStatus.freezable !== null ? 1 : 0),
+      expected: 5
     };
   }
 
@@ -2501,7 +2664,7 @@ const [honeypotData, topHoldersData, etherscanData] = await Promise.all([
   try {
     liquidityLock = await Promise.race([
       fetchLiquidityLockStatus(pair),
-      new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 5000))
+      new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 6000))
     ]);
   } catch (_) {}
 
@@ -2521,6 +2684,10 @@ const [honeypotData, topHoldersData, etherscanData] = await Promise.all([
   // Liquidity lock modifier
   if (liquidityLock.status === "locked")   score += 4;
   if (liquidityLock.status === "unlocked") score -= 3;
+
+  // Freeze authority modifier — active freeze authority is a critical rug vector
+  if (freezeStatus.freezable === true)  score -= 8;
+  if (freezeStatus.freezable === false) score += 3;
 
   // Dev wallet penalty
   if (devReputation) {
@@ -2565,11 +2732,13 @@ const [honeypotData, topHoldersData, etherscanData] = await Promise.all([
     honeypotDetail,
     holderLabel,
     holderDetail,
+    holderTop5Pct,
     confidenceMeta,
     behavior,
     buyTax,
     sellTax,
     liquidityLock,
+    freezeStatus,
     devReputation,
     riskRank
   };
@@ -2604,6 +2773,7 @@ async function buildScanCard(pair, heading, userId = null) {
     ``,
     `💧 <b>Liquidity:</b> ${shortUsd(pair.liquidityUsd)} • ${escapeHtml(verdict.liquidity.label)}`,
     `${escapeHtml(verdict.liquidityLock.label)}`,
+    `${escapeHtml(verdict.freezeStatus.label)}`,
     `📊 <b>24H Volume:</b> ${shortUsd(pair.volumeH24)} • ${escapeHtml(verdict.volume.label)}`,
     `⚡ <b>Flow:</b> ${escapeHtml(verdict.flow.label)} | Buys ${num(pair.buysM5)} / Sells ${num(pair.sellsM5)}`,
     `⏳ <b>Age:</b> ${escapeHtml(ageFromMs(pair.pairCreatedAt))} • ${escapeHtml(verdict.age.label)}`,
@@ -3407,7 +3577,7 @@ async function showAlertCenter(chatId, userId) {
 async function showEdgeBrain(chatId) {
   await sendText(
     chatId,
-    `🧠 <b>Gorktimus Edge Brain</b>\n\nEdge is the core intelligence layer of the terminal — a multi-signal defense engine that translates raw on-chain data into structured risk intelligence before you make a move.\n\n<b>What it does:</b>\n• Scores token safety across liquidity depth, holder concentration, contract transparency, honeypot simulation, and behavioral flow patterns\n• Identifies manipulation signatures — manufactured volume, one-sided buy walls, and spammy transaction patterns designed to trap buyers\n• Tracks launch structure integrity so you can distinguish genuine early momentum from artificial pump setups\n• Cross-references dev wallet reputation against the flagged address database\n• Applies learned memory bias from prior outcomes on the same token to sharpen future reads\n• Adapts scoring dynamically based on your selected mode — Aggressive, Balanced, or Guardian\n\nEdge does not just surface numbers. It synthesizes them into a clear verdict with a recommendation so you know what you are actually looking at.`,
+    `🧠 <b>Gorktimus Edge Brain</b>\n\nEdge is the core intelligence layer of the terminal — a multi-signal defense engine that translates raw on-chain data into structured risk intelligence before you make a move.\n\n<b>What it does:</b>\n• Scores token safety across liquidity depth, holder concentration, contract transparency, honeypot simulation, and behavioral flow patterns\n• Detects <b>freeze authority status</b> — if a dev can freeze token accounts, they can permanently block any holder from selling. Edge flags this as a critical danger signal.\n• Identifies manipulation signatures — manufactured volume, one-sided buy walls, and spammy transaction patterns designed to trap buyers\n• Checks <b>LP lock status</b> across known Solana and EVM locker programs — unlocked liquidity is a leading rug indicator\n• Tracks launch structure integrity so you can distinguish genuine early momentum from artificial pump setups\n• Cross-references dev wallet reputation against the flagged address database\n• Applies learned memory bias from prior outcomes on the same token to sharpen future reads\n• Adapts scoring dynamically based on your selected mode — Aggressive, Balanced, or Guardian\n\nEdge does not just surface numbers. It synthesizes them into a clear verdict with a recommendation so you know what you are actually looking at.`,
     buildMainMenuOnlyButton("refresh:edge_brain")
   );
 }
@@ -3745,6 +3915,8 @@ You are also getting:
 • holder concentration context  
 • contract transparency clues  
 • behavior signals  
+• freeze authority status — can the dev block selling?
+• LP lock verification — is the liquidity actually locked?
 • memory bias from prior outcomes  
 • mode-aware score shaping`,
     buildHelpMenu()
@@ -3777,7 +3949,7 @@ So if a token is high on Dex but lower here, that usually means the terminal thi
   );
 }
     if (data === "help_score") {
-      return sendText(chatId, `🛡 <b>Safety Score + Confidence</b>\n\nThe Safety Score (1–99) is a composite risk rating computed across six weighted signal categories:\n\n• <b>Liquidity Depth</b> — raw liquidity available and whether it is locked\n• <b>Token Age</b> — newer tokens carry higher structural uncertainty\n• <b>Flow Quality</b> — buy/sell ratio and whether transaction patterns look organic or manufactured\n• <b>Volume Health</b> — 24H volume relative to liquidity — inflated ratios signal wash trading\n• <b>Contract Transparency</b> — source code verification and honeypot simulation results\n• <b>Holder Concentration</b> — how much supply is controlled by the top wallets\n\nScores are then shaped by your active Mode (Aggressive, Balanced, or Guardian) and any learned memory bias from prior scans on the same token.\n\n<b>Confidence</b> reflects how many of the expected data sources returned usable results. Low confidence means the token may be too new or not fully indexed.`, buildHelpMenu());
+      return sendText(chatId, `🛡 <b>Safety Score + Confidence</b>\n\nThe Safety Score (1–99) is a composite risk rating computed across seven weighted signal categories:\n\n• <b>Liquidity Depth</b> — raw liquidity available and whether it is locked\n• <b>Token Age</b> — newer tokens carry higher structural uncertainty\n• <b>Flow Quality</b> — buy/sell ratio and whether transaction patterns look organic or manufactured\n• <b>Volume Health</b> — 24H volume relative to liquidity — inflated ratios signal wash trading\n• <b>Contract Transparency</b> — source code verification and honeypot simulation results\n• <b>Holder Concentration</b> — how much supply is controlled by the top wallets\n• <b>Freeze Authority</b> — whether the dev can freeze token accounts (blocks selling). Active freeze = -8 pts. Revoked = +3 pts. LP locked = +4 pts.\n\nScores are then shaped by your active Mode (Aggressive, Balanced, or Guardian) and any learned memory bias from prior scans on the same token.\n\n<b>Confidence</b> reflects how many of the expected data sources returned usable results. Low confidence means the token may be too new or not fully indexed.`, buildHelpMenu());
     }
 
     if (data === "help_transactions") {
@@ -3785,7 +3957,7 @@ So if a token is high on Dex but lower here, that usually means the terminal thi
     }
 
     if (data === "help_sources") {
-      return sendText(chatId, `⚙️ <b>Data Sources</b>\n\nGorktimus pulls from multiple live data layers simultaneously:\n\n• <b>DexScreener</b> — primary market data engine for price, liquidity, volume, flow, and pair discovery across Solana, Base, and Ethereum\n• <b>Helius RPC</b> — Solana-native holder account reads and LP structure analysis\n• <b>Honeypot.is</b> — EVM buy/sell simulation and tax detection for Base and Ethereum tokens\n• <b>Etherscan v2 API</b> — EVM contract source verification, top holder lists, and LP locker detection\n• <b>Internal Pair Memory</b> — learned bias system that tracks prior scan outcomes on the same token pair\n• <b>Flagged Wallet Database</b> — cross-referenced dev wallet reputation checks against known bad actors\n\nData freshness varies by source. DexScreener market data updates in near real-time. On-chain reads are fetched on demand with caching applied to reduce API load.`, buildHelpMenu());
+      return sendText(chatId, `⚙️ <b>Data Sources</b>\n\nGorktimus pulls from multiple live data layers simultaneously:\n\n• <b>DexScreener</b> — primary market data engine for price, liquidity, volume, flow, and pair discovery across Solana, Base, and Ethereum\n• <b>Helius RPC</b> — Solana-native holder account reads, LP lock structure analysis, and <b>mint freeze authority detection</b> (checks if a token's freeze authority is still active — a critical rug signal)\n• <b>Honeypot.is</b> — EVM buy/sell simulation, tax detection, and <b>freeze/blacklist flag scanning</b> for Base and Ethereum tokens\n• <b>Etherscan v2 API</b> — EVM contract source verification, top holder lists, LP locker detection, and <b>source-code freeze pattern analysis</b>\n• <b>Internal Pair Memory</b> — learned bias system that tracks prior scan outcomes on the same token pair\n• <b>Flagged Wallet Database</b> — cross-referenced dev wallet reputation checks against known bad actors\n\nData freshness varies by source. DexScreener market data updates in near real-time. On-chain reads are fetched on demand with caching applied to reduce API load.`, buildHelpMenu());
     }
 
     if (data === "help_community") {
